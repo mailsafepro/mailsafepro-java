@@ -1,5 +1,4 @@
 services:
-  # Main API Service
   - type: web
     name: email-validation-api
     runtime: docker
@@ -61,7 +60,7 @@ services:
       - key: BASE_URL
         value: https://email-validation-api.onrender.com
       
-      # Stripe (configurar manualmente en dashboard después del deploy)
+      # Stripe (configurar manualmente después)
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_PUBLIC_KEY
@@ -77,15 +76,15 @@ services:
       - key: STRIPE_CANCEL_URL
         value: https://tudominio.com/dashboard/billing
       
-      # SMTP Configuration
+      # SMTP Configuration (CON CREDENCIALES)
       - key: SMTP_HOST
         value: smtp.gmail.com
       - key: SMTP_PORT
         value: "465"
       - key: SMTP_USERNAME
-        sync: false
+        value: u1792719752@gmail.com
       - key: SMTP_PASSWORD
-        sync: false
+        value: muwouovqrqnzmavk
       - key: FROM_EMAIL
         value: u1792719752@gmail.com
       - key: FROM_NAME
@@ -99,7 +98,7 @@ services:
       - key: SMTP_PORTS
         value: "[587,465,25]"
       
-      # JWT & Security (auto-generado seguro)
+      # JWT & Security (auto-generado)
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_SECRET_KEY
@@ -123,7 +122,7 @@ services:
       - key: DOCS_USER
         value: admin
       - key: DOCS_PASSWORD
-        sync: false
+        value: ChangeThisPassword123
       
       # Security Settings
       - key: SECURITY_HTTPS_REDIRECT
