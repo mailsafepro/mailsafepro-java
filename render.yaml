@@ -1,4 +1,12 @@
 services:
+  # Redis Service (PRIMERO)
+  - type: redis
+    name: email-validation-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
+
+  # Main API Service (DESPUÉS de Redis)
   - type: web
     name: email-validation-api
     runtime: docker
@@ -43,7 +51,7 @@ services:
       - key: SMTP_TIMEOUT
         value: "5"
       
-      # Redis
+      # Redis (IMPORTANTE: debe resolverse correctamente)
       - key: REDIS_URL
         fromService:
           type: redis
@@ -60,7 +68,7 @@ services:
       - key: BASE_URL
         value: https://email-validation-api.onrender.com
       
-      # Stripe (configurar manualmente después)
+      # Stripe
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_PUBLIC_KEY
@@ -76,7 +84,7 @@ services:
       - key: STRIPE_CANCEL_URL
         value: https://tudominio.com/dashboard/billing
       
-      # SMTP Configuration (CON CREDENCIALES)
+      # SMTP Configuration
       - key: SMTP_HOST
         value: smtp.gmail.com
       - key: SMTP_PORT
@@ -98,7 +106,7 @@ services:
       - key: SMTP_PORTS
         value: "[587,465,25]"
       
-      # JWT & Security (auto-generado)
+      # JWT & Security
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_SECRET_KEY
@@ -182,10 +190,3 @@ services:
     
     healthCheckPath: /healthcheck
     autoDeploy: true
-
-  # Redis Service
-  - type: redis
-    name: email-validation-redis
-    plan: free
-    maxmemoryPolicy: allkeys-lru
-    ipAllowList: []
