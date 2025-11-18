@@ -1,0 +1,26 @@
+route:
+  receiver: team-default
+  group_by: ['alertname','service']
+  group_wait: 15s
+  group_interval: 2m
+  repeat_interval: 2h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: team-critical
+    - matchers: [severity="warning"]
+      receiver: team-default
+
+inhibit_rules:
+  - source_matchers: [severity="critical"]
+    target_matchers: [severity="warning"]
+    equal: ['alertname','service']
+
+receivers:
+  - name: team-default
+    webhook_configs:
+      - url: 'http://api:8000/webhooks/prom-alerts'
+        send_resolved: true
+  - name: team-critical
+    webhook_configs:
+      - url: 'http://api:8000/webhooks/prom-alerts'
+        send_resolved: true

@@ -1,0 +1,17 @@
+groups:
+- name: email-api-burn
+  rules:
+  - record: slo:validation_latency_p99_gt5s:bool
+    expr: (histogram_quantile(0.99, sum by (le) (rate(email_validation_business_validation_duration_seconds_bucket[5m])))) > 5 OR on() vector(0)
+
+  - alert: HighLatencyBurnFast
+    expr: avg_over_time(slo:validation_latency_p99_gt5s:bool[5m]) > 0.02
+    for: 5m
+    labels: {severity: warning, service: email-api}
+    annotations: {summary: "SLO p99 latencia quemándose (5m)", runbook: "docs/SLO.md"}
+
+  - alert: HighLatencyBurnSlow
+    expr: avg_over_time(slo:validation_latency_p99_gt5s:bool[1h]) > 0.01
+    for: 30m
+    labels: {severity: critical, service: email-api}
+    annotations: {summary: "SLO p99 latencia quemándose (1h)", runbook: "docs/SLO.md"}

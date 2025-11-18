@@ -1,0 +1,125 @@
+services:
+  # Main API Service
+  - type: web
+    name: email-validation-api
+    runtime: docker
+    plan: free
+    region: frankfurt  # Puedes cambiar a oregon, singapore, etc.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      # Environment
+      - key: ENVIRONMENT
+        value: production
+      - key: DOCKER_ENV
+        value: "0"
+      
+      # DNS Configuration
+      - key: DNS_NAMESERVERS
+        value: 8.8.8.8,8.8.4.4
+      - key: DNS_TIMEOUT
+        value: "5.0"
+      - key: VALIDATION_DNS_TIMEOUT
+        value: "5.0"
+      - key: RETRY_ATTEMPTS
+        value: "2"
+      - key: RETRY_MAX_BACKOFF
+        value: "1.0"
+      - key: MAX_VALIDATION_TIME
+        value: "30.0"
+      
+      # Redis
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: email-validation-redis
+          property: connectionString
+      
+      # Logging
+      - key: LOG_LEVEL
+        value: INFO
+      
+      # SMTP
+      - key: SMTP_TIMEOUT
+        value: "10.0"
+      
+      # Stripe (configurar manualmente en dashboard)
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PREMIUM_PLAN_ID
+        sync: false
+      - key: STRIPE_ENTERPRISE_PLAN_ID
+        sync: false
+      
+      # JWT (auto-generado seguro)
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_EXPIRATION_MINUTES
+        value: "30"
+      
+      # Security
+      - key: CORS_ORIGINS
+        value: "*"  # Cambiar en producción
+      - key: HTTPS_REDIRECT
+        value: "true"
+      
+      # Monitoring
+      - key: METRICS_ENABLED
+        value: "true"
+    
+    healthCheckPath: /healthcheck
+    autoDeploy: true
+
+  # Background Worker Service
+  - type: worker
+    name: email-validation-worker
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m app.jobs.jobs_worker
+    dockerContext: .
+    envVars:
+      # Environment
+      - key: ENVIRONMENT
+        value: production
+      - key: DOCKER_ENV
+        value: "0"
+      
+      # DNS Configuration
+      - key: DNS_NAMESERVERS
+        value: 8.8.8.8,8.8.4.4
+      - key: DNS_TIMEOUT
+        value: "5.0"
+      - key: VALIDATION_DNS_TIMEOUT
+        value: "5.0"
+      - key: RETRY_ATTEMPTS
+        value: "2"
+      - key: RETRY_MAX_BACKOFF
+        value: "1.0"
+      - key: MAX_VALIDATION_TIME
+        value: "30.0"
+      
+      # Redis
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: email-validation-redis
+          property: connectionString
+      
+      # Logging
+      - key: LOG_LEVEL
+        value: INFO
+    
+    autoDeploy: true
+
+  # Redis Service
+  - type: redis
+    name: email-validation-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []  # Permite acceso desde todos los servicios de Render

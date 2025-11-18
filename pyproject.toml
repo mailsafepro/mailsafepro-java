@@ -1,0 +1,46 @@
+[project]
+name = "toni"
+version = "0.1.0"
+description = "API de validación de correos con FastAPI"
+authors = [{ name = "Pablo" }]
+readme = ""
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+# Configuración alternativa a pytest.ini (opcional, pero buena práctica)
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "*/tests/*",
+    "*/conftest.py",
+    "*/__pycache__/*",
+    "*/.venv/*",
+    "*/venv/*"
+]
+branch = true
+concurrency = ["thread"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod"
+]
+
+[tool.coverage.html]
+directory = "htmlcov"

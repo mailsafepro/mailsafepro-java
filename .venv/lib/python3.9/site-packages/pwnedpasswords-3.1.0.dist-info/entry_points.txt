@@ -1,0 +1,2 @@
+[console_scripts]
+pwnedpasswords = pwnedpasswords.__main__:main

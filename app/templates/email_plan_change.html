@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; color: white; }
+        .content { padding: 30px; background-color: #f9f9f9; }
+        .footer { padding: 20px; text-align: center; font-size: 12px; color: #6c757d; }
+        .plan-box { background-color: white; border-left: 4px solid #667eea; padding: 15px; margin: 20px 0; }
+        .button { display: inline-block; padding: 12px 24px; background-color: #667eea; color: white; text-decoration: none; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Plan Updated</h1>
+    </div>
+    <div class="content">
+        <h2>Hello!</h2>
+        <p>Your subscription plan has been successfully updated.</p>
+        
+        <div class="plan-box">
+            <p><strong>Previous Plan:</strong> {{ old_plan }}</p>
+            <p><strong>New Plan:</strong> {{ new_plan }}</p>
+            <p><strong>Effective:</strong> {{ effective_date }}</p>
+        </div>
+        
+        <p>All your API keys have been automatically updated with the new limits and features.</p>
+        
+        <p>If you have any questions or didn't request this change, please contact our support team.</p>
+        
+        <p style="text-align: center;">
+            <a href="https://yourapp.com/dashboard" class="button">Go to Dashboard</a>
+        </p>
+    </div>
+    <div class="footer">
+        <p>© {{ current_year }} Email Validation API. All rights reserved.</p>
+        <p>This is an automated message, please do not reply directly to this email.</p>
+    </div>
+</body>
+</html>
