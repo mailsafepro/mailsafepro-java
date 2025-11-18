@@ -6,7 +6,7 @@ services:
     maxmemoryPolicy: allkeys-lru
     ipAllowList: []
 
-  # Main API Service (DESPUÉS de Redis)
+  # Main API Service
   - type: web
     name: email-validation-api
     runtime: docker
@@ -51,12 +51,9 @@ services:
       - key: SMTP_TIMEOUT
         value: "5"
       
-      # Redis (IMPORTANTE: debe resolverse correctamente)
+      # Redis (CONFIGURAR MANUALMENTE después)
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: email-validation-redis
-          property: connectionString
+        sync: false
       
       # Logging
       - key: LOG_LEVEL
