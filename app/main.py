@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Body
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.openapi.docs import get_redoc_html
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -165,6 +165,16 @@ app = FastAPI(
         {"name": "Billing", "description": "Gestión de planes y facturación"},
     ],
 )
+
+# Sobrescribir ReDoc con CDN estable
+@app.get("/redoc", include_in_schema=False)
+async def custom_redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js",
+        redoc_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+    )
 
 # Example Pydantic models for validation endpoint
 class EmailValidationRequest(BaseModel):

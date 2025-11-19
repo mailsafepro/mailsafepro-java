@@ -187,16 +187,32 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             )
 
     def _add_security_headers(self, response: Response, path: str) -> None:
+        """Añadir cabeceras de seguridad CSP diferenciadas por ruta."""
+        
         # CSP específica para /docs (Swagger UI)
         csp_docs = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com data:; "
-            "img-src 'self' data: https: https://fastapi.tiangolo.com; "  # ← Añadido https: y fastapi.tiangolo.com
+            "img-src 'self' data: https: https://fastapi.tiangolo.com; "
             "connect-src 'self'; "
             "frame-src 'self'; "
             "worker-src 'self'"
+        )
+        
+        # CSP para /redoc (más permisiva para CDNs)
+        csp_redoc = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdn.redoc.ly https://unpkg.com; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.redoc.ly https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com data:; "
+            "img-src 'self' data: https: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
+            "connect-src 'self' https:; "
+            "worker-src 'self' blob:; "
+            "child-src 'self' blob:; "
+            "object-src 'none'; "
+            "base-uri 'self'"
         )
         
         # CSP por defecto (restrictiva)
@@ -211,42 +227,36 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "worker-src 'self'"
         )
         
-        # CSP para /redoc
-        csp_redoc = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdn.redoc.ly; "
-            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com data:; "
-            "img-src 'self' data: https: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
-            "connect-src 'self' https://api.redoc.ly; "
-            "worker-src 'self' blob:; "
-            "child-src 'self' blob:; "
-            "object-src 'none'; "
-            "base-uri 'self'"
-        )
-
-    
         # Seleccionar CSP según ruta
         if path == "/docs":
             response.headers["Content-Security-Policy"] = csp_docs
         elif path == "/redoc":
             response.headers["Content-Security-Policy"] = csp_redoc
-        else:
-            response.headers["Content-Security-Policy"] = csp_default
-
-        # Cabeceras comunes; eliminamos X-XSS-Protection (deprecado)
-        response.headers.update(
-            {
-                "X-Content-Type-Options": "nosniff",
+            # NO añadir X-Content-Type-Options para ReDoc (causa problemas con CDN)
+            response.headers.update({
                 "Permissions-Policy": (
                     "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), "
                     "microphone=(), payment=(), usb=()"
                 ),
                 "Referrer-Policy": "strict-origin-when-cross-origin",
                 "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
-                "X-Frame-Options": "DENY",
-            }
-        )
+                "X-Frame-Options": "SAMEORIGIN",  # Cambiado a SAMEORIGIN para ReDoc
+            })
+            return  # ← Importante: salir aquí para /redoc
+        else:
+            response.headers["Content-Security-Policy"] = csp_default
+        
+        # Cabeceras comunes para el resto (excepto /redoc)
+        response.headers.update({
+            "X-Content-Type-Options": "nosniff",
+            "Permissions-Policy": (
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), "
+                "microphone=(), payment=(), usb=()"
+            ),
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+            "X-Frame-Options": "DENY",
+        })
 
 
 class CORSMiddleware(BaseHTTPMiddleware):
