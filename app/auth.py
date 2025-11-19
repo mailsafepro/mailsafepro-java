@@ -1229,6 +1229,7 @@ async def validate_api_key_string(
 
 
 @router.get("/health/auth")
+@router.head("/health/auth")
 async def auth_health_check(redis: Redis = Depends(get_redis)):
     """Health check para autenticación: Redis, JWT y hashing."""
     try:

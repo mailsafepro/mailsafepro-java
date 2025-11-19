@@ -2679,6 +2679,7 @@ _service_start_time = time.time()
 
 
 @router.get("/health")
+@router.head("/health")
 async def health_check(redis=Depends(get_redis)) -> Dict[str, Any]:
     """Health check completo del servicio."""
     try:

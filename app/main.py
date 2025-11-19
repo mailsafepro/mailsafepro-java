@@ -184,6 +184,7 @@ async def validate_email(payload: EmailValidationRequest = Body(..., example={"e
 
 # Health and Redis checks
 @app.get("/healthcheck", include_in_schema=False)
+@app.head("/healthcheck", include_in_schema=False)
 async def healthcheck():
     return {"status": "ok"}
 
