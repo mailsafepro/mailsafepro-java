@@ -148,18 +148,16 @@ async def background_tasks():
 
 # Define FastAPI app with professional docs info
 app = FastAPI(
-    title="Email Validation API — Enterprise-grade Email Verification",
-    description=(
-        "API robusta y segura para validación y verificación de correos electrónicos.\n"
-        "Soporta verificación individual y en lote, detección de brechas, y autenticación JWT.\n"
-        "Cumple con GDPR y dispone de planes de pago flexibles.\n\n"
-        "**Status del sistema:** [status.tudominio.com](https://mailsafepro1.statuspage.io)"
-    ),
-    version="2.5.0",
+    title=settings.documentation.title,
+    description=settings.documentation.description,
+    version=settings.documentation.version,
+    contact=settings.documentation.contact,
+    license_info={
+        "name": "Proprietary",
+    },
     docs_url="/docs" if settings.documentation.enabled else None,
     redoc_url="/redoc" if settings.documentation.enabled else None,
-    openapi_url="/openapi.json" if (settings.documentation.enabled and settings.environment != EnvironmentEnum.PRODUCTION) else None,
-    contact=settings.documentation.contact,
+    openapi_url="/openapi.json" if settings.documentation.enabled else None,
     lifespan=lifespan,
     openapi_tags=[
         {"name": "Authentication", "description": "Login, registro y manejo de tokens"},

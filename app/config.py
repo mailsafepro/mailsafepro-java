@@ -320,16 +320,31 @@ class APIDocumentationSettings(BaseSettings):
     enabled: bool = Field(default=True, description="Enable API documentation endpoints")
     user: str = Field(default="admin", min_length=1, description="Docs basic auth user", alias="DOCS_USER")
     password: SecretStr = Field(
-        default=SecretStr("test_docs_password"),  # AGREGAR default
+        default=SecretStr("test_docs_password"),
         description="Docs basic auth password",
         alias="DOCS_PASSWORD"
     )
     favicon_url: Optional[str] = Field(default="/static/favicon.ico", description="Swagger favicon")
-    title: str = Field(default="Email Validation API", description="API title")
-    version: str = Field(default="2.0.0", description="API version")
-    description: str = Field(default="Enterprise-grade email validation and verification API", description="API description")
+    title: str = Field(default="Email Validation API — Enterprise-grade Email Verification", description="API title")
+    version: str = Field(default="2.5.0", description="API version")
+    description: str = Field(
+        default=(
+            "API robusta y segura para validación y verificación de correos electrónicos.\n"
+            "Soporta verificación individual y en lote, detección de brechas, y autenticación JWT.\n"
+            "Cumple con GDPR y dispone de planes de pago flexibles.\n\n"
+            "**🔗 Enlaces importantes:**\n"
+            "- [Estado del sistema](https://mailsafepro.betteruptime.com)\n"
+            "- [Documentación completa](https://email-validation-api-jlra.onrender.com/redoc)\n\n"
+            "**📧 Contacto:** mailsafepro1@gmail.com"
+        ),
+        description="API description"
+    )
     contact: Dict[str, str] = Field(
-        default={"name": "API Support", "email": "support@emailvalidator.com", "url": "https://emailvalidator.com/support"},
+        default={
+            "name": "MailSafePro Support",
+            "email": "mailsafepro1@gmail.com",
+            "url": "https://mailsafepro.betteruptime.com"
+        },
         description="API contact",
     )
 
