@@ -201,19 +201,22 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "worker-src 'self'"
         )
         
-        # CSP para /redoc (más permisiva para CDNs)
+        # CSP para /redoc
         csp_redoc = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://cdn.redoc.ly https://unpkg.com; "
-            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.redoc.ly https://fonts.googleapis.com; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' "
+            "https://cdn.jsdelivr.net https://cdn.redoc.ly https://unpkg.com; "
+            "style-src 'self' 'unsafe-inline' "
+            "https://cdn.jsdelivr.net https://cdn.redoc.ly https://fonts.googleapis.com https://cdn.honey.io; "  # ← Añadido cdn.honey.io
             "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com data:; "
-            "img-src 'self' data: https: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
+            "img-src 'self' data: https:; "
             "connect-src 'self' https:; "
             "worker-src 'self' blob:; "
             "child-src 'self' blob:; "
             "object-src 'none'; "
             "base-uri 'self'"
         )
+
         
         # CSP por defecto (restrictiva)
         csp_default = (

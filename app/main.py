@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, Body
 from fastapi.openapi.docs import get_redoc_html
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 from redis.asyncio import Redis
 import starlette.status as _status
@@ -156,7 +156,7 @@ app = FastAPI(
         "name": "Proprietary",
     },
     docs_url="/docs" if settings.documentation.enabled else None,
-    redoc_url="/redoc" if settings.documentation.enabled else None,
+    redoc_url=None,  # ← DESHABILITAR ReDoc por defecto
     openapi_url="/openapi.json" if settings.documentation.enabled else None,
     lifespan=lifespan,
     openapi_tags=[
@@ -168,13 +168,29 @@ app = FastAPI(
 
 # Sobrescribir ReDoc con CDN estable
 @app.get("/redoc", include_in_schema=False)
-async def custom_redoc_html():
-    return get_redoc_html(
-        openapi_url=app.openapi_url,
-        title=f"{app.title} - ReDoc",
-        redoc_js_url="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js",
-        redoc_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
-    )
+async def redoc_html():
+    """ReDoc documentation with stable CDN."""
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{app.title} - ReDoc</title>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link href="https://fonts.googleapis.com/css?family=Montserrat:300,400,700|Roboto:300,400,700" rel="stylesheet">
+        <style>
+            body {{
+                margin: 0;
+                padding: 0;
+            }}
+        </style>
+    </head>
+    <body>
+        <redoc spec-url="/openapi.json"></redoc>
+        <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+    </body>
+    </html>
+    """)
 
 # Example Pydantic models for validation endpoint
 class EmailValidationRequest(BaseModel):
