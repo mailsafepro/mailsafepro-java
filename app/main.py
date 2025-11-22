@@ -228,10 +228,10 @@ app.add_middleware(SecurityHeadersMiddleware, environment=settings.environment.v
 app.add_middleware(HistoricalKeyMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.security.cors_origins,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
-    allow_credentials=settings.security.https_redirect,
+    allow_origins=["*"],  # Permissive for Widget access
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
     max_age=86400,
 )
 if settings.monitoring.metrics_enabled and settings.environment != EnvironmentEnum.TESTING:
