@@ -1,0 +1,45 @@
+groups:
+- name: mailsafepro-infrastructure-alerts
+  rules:
+  # High Error Rate (Generic API)
+  - alert: HighErrorRate
+    expr: |
+      sum(rate(http_requests_total{status=~"5.."}[5m])) 
+      / 
+      sum(rate(http_requests_total[5m])) > 0.01
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High API Error Rate (>1%)"
+      description: "API is returning 5xx errors for >1% of requests. Current rate: {{ $value | humanizePercentage }}."
+
+  # High Latency (Generic API)
+  - alert: HighApiLatency
+    expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 1.0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High API Latency (p99 > 1s)"
+      description: "99th percentile latency is {{ $value | humanizeDuration }}."
+
+  # Redis Down
+  - alert: RedisDown
+    expr: redis_up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Redis is down"
+      description: "Redis instance is unreachable. Rate limiting and caching will fail."
+
+  # High Redis Saturation
+  - alert: HighRedisSaturation
+    expr: redis_connected_clients / redis_max_clients > 0.8
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High Redis Connection Usage"
+      description: "Redis connection pool is >80% full."

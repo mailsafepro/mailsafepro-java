@@ -1,35 +1,108 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0.post1
-httpx==0.27.0
-pydantic==2.11.5
-pydantic-settings==2.9.1
-python-jose[cryptography]==3.3.0
-redis==5.0.4
-dnspython==2.6.1
-pytest==8.3.5
-pytest-asyncio>=0.26.0
+# ============================================
+# CORE DEPENDENCIES (Required)
+# ============================================
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0  # Updated to fix conflicts with fastapi and pydantic-settings
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# Database & Caching
+redis[hiredis]==5.0.1
+asyncio-redis==0.16.0
+arq==0.25.0
+
+# Authentication & Security
+PyJWT==2.8.0  # MIGRATED from python-jose (more secure)
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-multipart==0.0.6
+cryptography==42.0.2
+zxcvbn-python==4.4.24
+
+# Email Validation
+dnspython==2.0.0
+aiodns==3.1.1
+pycares==4.4.0
+idna==3.6
+tldextract==5.1.1
+email-validator==2.1.0.post1
+ipwhois==1.2.0
+
+# HTTP & Networking
+httpx==0.26.0
+aiohttp==3.9.1
+aiosmtplib==3.0.1
+
+# Stripe Integration
+stripe==7.11.0
+
+# Logging
+loguru==0.7.2
+
+# Metrics & Monitoring
+prometheus-client==0.19.0
+prometheus-fastapi-instrumentator==6.1.0
+
+# CORS & Middleware
+# python-jose-cryptodome removed (legacy, unused)
+
+# Utilities
+orjson==3.9.10
+python-dateutil==2.8.2
+
+# ============================================
+# TESTING DEPENDENCIES
+# ============================================
+pytest==7.4.3  # Stable version without conflicts
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+pytest-dotenv==0.5.2
+pytest-timeout==2.2.0
+pytest-mock==3.12.0
+pytest-xdist==3.5.0
 asgi-lifespan==2.1.0
 anyio==3.7.1
-prometheus_client==0.22.0
-prometheus_fastapi_instrumentator==6.1.0
-retry==0.9.2
-loguru
-email-validator==2.2.0
-pydantic[email]==2.11.5
-pytest-dotenv
-pytest-timeout
+hypothesis==6.92.1
+faker==22.0.0
+factory-boy==3.3.0
+freezegun==1.4.0
+responses==0.24.1
+httpx==0.26.0  # For TestClient
+
+# ============================================
+# DEVELOPMENT & CODE QUALITY
+# ============================================
+bandit==1.7.6
+# safety removed - conflicts with pydantic 2.x (requires pydantic <2.0)
+mypy==1.8.0
+black==24.1.1
+flake8==7.0.0
+isort==5.13.2
+pre-commit==3.6.0
+datamodel-code-generator==0.25.2
+
+# ============================================
+# OBSERVABILITY (Optional - can be disabled)
+# ============================================
+opentelemetry-api==1.22.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+opentelemetry-instrumentation-redis==0.43b0
+opentelemetry-instrumentation-aiohttp-client==0.43b0
+opentelemetry-exporter-otlp==1.22.0
+# Note: Jaeger exporter is optional, use OTLP in production
+# opentelemetry-exporter-jaeger==1.21.0
+
+# Structured Logging
+structlog==24.1.0
+python-json-logger==2.0.7
+
+# Advanced Error Handling
+tenacity==8.2.3
+
+# System Monitoring
+psutil==5.9.8
+retry
 pybreaker
-ipwhois>=1.2.0
-stripe
-python-multipart>=0.0.6
-passlib[bcrypt]==1.7.4
-aiosmtplib==2.0.1
-Jinja2==3.1.2
-tldextract
-aiodns
-cryptography
-pyspf
-pytest-cov
-bcrypt==4.0.1
-pwnedpasswords
-aiohttp
+fakeredis[lua]

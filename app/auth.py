@@ -10,8 +10,9 @@ import time
 from uuid import uuid4
 
 from passlib.context import CryptContext
-from jose import JWTError, jwt
-from jose.exceptions import ExpiredSignatureError, JWTClaimsError
+import jwt
+from jwt.exceptions import InvalidTokenError, ExpiredSignatureError, InvalidIssuerError
+
 
 from fastapi import (
     Depends,
@@ -30,7 +31,9 @@ from fastapi.security import (
     HTTPBasicCredentials,
 )
 from redis.asyncio import Redis
+from arq.connections import ArqRedis
 from pydantic import ValidationError
+from zxcvbn import zxcvbn
 
 from app.config import settings
 from app.models import (
@@ -141,6 +144,14 @@ basic_auth = HTTPBasic(auto_error=False)
 
 
 def get_redis(request: Request) -> Redis:
+    if not hasattr(request.app.state, "redis") or request.app.state.redis is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return request.app.state.redis
+
+def get_arq_redis(request: Request) -> ArqRedis:
+    if not hasattr(request.app.state, "arq_redis") or request.app.state.arq_redis is None:
+        raise HTTPException(status_code=503, detail="Job queue unavailable")
+    return request.app.state.arq_redis
     """Obtiene la instancia de Redis desde el estado de la app."""
     return request.app.state.redis
 
@@ -210,8 +221,12 @@ def _jwt_verify_key(token: str) -> Union[str, bytes]:
     header = jwt.get_unverified_header(token)
     kid = header.get("kid")
     if not kid or kid not in settings.jwt.public_keys:
-        raise JWTError("Unknown or missing kid")
+        raise InvalidTokenError("Unknown or missing kid")
     return settings.jwt.public_keys[kid]
+
+def _get_unverified_claims(token: str) -> dict:
+    """PyJWT compatible version of get_unverified_claims."""
+    return jwt.decode(token, options={"verify_signature": False}, algorithms=[JWT_ALGORITHM])
 
 
 LUA_RATE_LIMIT = """
@@ -245,6 +260,15 @@ async def create_user(redis: Redis, email: str, password: str, plan: str = "FREE
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid email format")
     if len(password) < 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters long")
+    
+    # ✅ Password Strength Check (zxcvbn)
+    results = zxcvbn(password)
+    if results["score"] < 3: # 0-4 scale, 3 is "safe"
+        logger.warning(f"Weak password attempt for {email}: score {results['score']}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password too weak. Suggestions: {', '.join(results['feedback']['suggestions'] or ['Use a stronger password'])}"
+        )
 
     user_id = str(uuid4())
     hashed_password = get_password_hash(password)
@@ -382,8 +406,8 @@ async def get_user_by_email(redis: Redis, email: str) -> Optional[UserInDB]:
                 "email_verified": "true" if model_fields["email_verified"] else "false",
             },
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error updating user backfill for {user_id}: {e}")
 
     return UserInDB(**model_fields)
 
@@ -555,8 +579,8 @@ async def validate_api_key_or_token(
                 if key_data:
                     key_info = json.loads(_decode_value(key_data))
                     plan = key_info.get("plan", plan)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to get plan from key data: {e}")
 
             scopes = PLAN_SCOPES.get(plan.upper(), PLAN_SCOPES["FREE"])
             sub_subject = user_id if user_id else api_key_str
@@ -657,8 +681,8 @@ async def get_current_client(
         logger.warning("Token expired")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
     
-    except (JWTClaimsError, JWTError) as e:
-        logger.warning("JWT validation error: %s", str(e)[:200])  # ← AQUÍ LOG DEL ERROR REAL
+    except (InvalidIssuerError, InvalidTokenError) as e:
+        logger.warning("JWT validation error: %s", str(e)[:200])
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     except ValidationError as e:
@@ -740,7 +764,7 @@ async def register_web_user(
         refresh_token, refresh_exp = create_refresh_token({"sub": user.id, "email": user.email}, plan=user_data.plan)
 
         # Guardar refresh jti
-        refresh_payload = jwt.get_unverified_claims(refresh_token)
+        refresh_payload = _get_unverified_claims(refresh_token)
         await store_refresh_token(refresh_payload["jti"], refresh_exp, redis)
 
         return {
@@ -770,22 +794,31 @@ async def login_web_user(
         client_ip = request.client.host if request.client else "unknown"
         await enforce_rate_limit(redis, bucket=f"login:{user_data.email}:{client_ip}", limit=10, window=300)
         user = await get_user_by_email(redis, user_data.email)
+        # ✅ Generic Error & Security Logging
+        invalid_credentials_exc = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
         if not user:
-            logger.warning("User not found: %s", user_data.email)
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            logger.warning(f"Login failed: User not found ({user_data.email})", security_event=True)
+            # Simulate password verification time to prevent timing attacks
+            pwd_context.verify("dummy_password", "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWrn3ILAWOi/lPa.U4Mc.Oq.p.h.m") 
+            raise invalid_credentials_exc
 
         if not getattr(user, "hashed_password", None):
-            logger.warning("User without password hash: %s", user_data.email)
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            logger.warning(f"Login failed: User without password hash ({user_data.email})", security_event=True)
+            raise invalid_credentials_exc
 
         if not verify_password(user_data.password, user.hashed_password):
-            logger.warning("Invalid password for user: %s", user_data.email)
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+            logger.warning(f"Login failed: Invalid password for {user_data.email}", security_event=True)
+            raise invalid_credentials_exc
 
         access_token = create_access_token({"sub": user.id, "email": user.email}, plan=user.plan)
         refresh_token, refresh_exp = create_refresh_token({"sub": user.id, "email": user.email}, plan=user.plan)
 
-        refresh_payload = jwt.get_unverified_claims(refresh_token)
+        refresh_payload = _get_unverified_claims(refresh_token)
         await store_refresh_token(refresh_payload["jti"], refresh_exp, redis)
 
         return {
@@ -930,7 +963,7 @@ async def refresh_token(
         )
         
         # 8) Guardar nuevo refresh jti
-        new_refresh_payload = jwt.get_unverified_claims(new_refresh_token)
+        new_refresh_payload = _get_unverified_claims(new_refresh_token)
         await store_refresh_token(new_refresh_payload["jti"], new_refresh_exp, redis)
         
         return {

@@ -53,6 +53,9 @@ from app.providers import (
     DNSAuthResults,
     DKIMInfo,
     is_disposable_email,
+    RiskScorer,  # ← NUEVO: Unified risk scoring
+    RiskAssessment,  # ← NUEVO
+    normalize_email_full,  # ← NUEVO: Full email normalization
 )
 from app.utils import increment_usage, _get_plan_config_safe
 from app.validation import (
@@ -61,6 +64,8 @@ from app.validation import (
     cached_check_domain,
     check_smtp_mailbox_safe,
     is_disposable_domain,
+    detect_catch_all_domain,  # ← NUEVO: Catch-all detection
+    is_abuse_domain,  # ← NUEVO: Abuse domain detection
 )
 
 router = APIRouter(tags=["Email Validation"])
@@ -576,10 +581,21 @@ class EmailValidationEngine:
         
         try:
             # ============================================================
-            # PASO 1A: Validar formato
+            # PASO 1A: Validar formato y normalizar COMPLETO
             # ============================================================
-            normalized_email = await self._validate_email_format(email)
-            logger.info(f"{validation_id} | Format validation passed | Email: {normalized_email}")
+            # 1. Validate format
+            formatted_email = await self._validate_email_format(email)
+            logger.info(f"{validation_id} | Format validation passed | Email: {formatted_email}")
+            
+            # 2. Apply full normalization (alias removal, Gmail dots, etc.)
+            normalized_email = normalize_email_full(formatted_email)
+            
+            # Log if normalization changed the email
+            if normalized_email != formatted_email:
+                logger.info(
+                    f"{validation_id} | Email normalized | "
+                    f"Original: {formatted_email} → Normalized: {normalized_email}"
+                )
             
             # ============================================================
             # PASO 1B: Verificar typos
@@ -882,7 +898,74 @@ class EmailValidationEngine:
             cache_used = full_validation_cached
             
             # ============================================================
-            # PASO 8: Construir respuesta principal
+            # PASO 7.8: DETECT CATCH-ALL (solo si check_smtp=true)
+            # ============================================================
+            catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'not_checked', 'details': 'Skipped'}
+            
+            if check_smtp:
+                try:
+                    # Extract domain from email
+                    domain = normalized_email.split('@')[-1]
+                    
+                    # Run catch-all detection with timeout
+                    catch_all_info = await asyncio.wait_for(
+                        detect_catch_all_domain(domain, redis=redis),
+                        timeout=10.0  # 10s timeout for catch-all check
+                    )
+                    
+                    logger.info(
+                        f"[{validation_id}] Catch-all check | "
+                        f"Domain: {domain} | "
+                        f"Is catch-all: {catch_all_info.get('is_catch_all')} | "
+                        f"Confidence: {catch_all_info.get('confidence'):.2f} | "
+                        f"Method: {catch_all_info.get('method')}"
+                    )
+                    
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{validation_id}] Catch-all detection timeout")
+                    catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'timeout', 'details': 'Timeout'}
+                
+                except Exception as e:
+                    logger.error(f"[{validation_id}] Catch-all detection error: {e}")
+                    catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'error', 'details': str(e)[:100]}
+            else:
+                logger.debug(f"[{validation_id}] Catch-all check skipped (check_smtp=false)")
+            
+            # ============================================================
+            # PASO 7.9: CALCULAR UNIFIED RISK SCORING (0-100)
+            # ============================================================
+            # Extract domain for toxic domain check
+            domain = normalized_email.split('@')[-1] if '@' in normalized_email else ''
+            is_toxic = is_abuse_domain(domain) if domain else False
+            
+            # Preparar datos para RiskScorer
+            validation_data = {
+                'valid': True,
+                'syntax_valid': True,  # Si llegamos aquí, syntax es válida
+                'smtp_checked': smtp_result["checked"],
+                'disposable': False,  # Ya fue filtrado antes
+                'role_based': role_email_info.get('is_role_email', False),
+                'catch_all': catch_all_info.get('is_catch_all', False),  # ✅ REAL VALUE
+                'toxic_domain': is_toxic,  # ✅ REAL VALUE
+            }
+            
+            # Calcular unified risk score
+            unified_risk = RiskScorer.calculate_risk(
+                validation_result=validation_data,
+                spam_trap_result=spam_trap_check,
+                breach_result=breach_info
+            )
+            
+            logger.info(
+                f"[{validation_id}] Unified risk scoring | "
+                f"Score: {unified_risk.score}/100 | "
+                f"Level: {unified_risk.level} | "
+                f"Confidence: {unified_risk.confidence:.2%} | "
+                f"Factors: {unified_risk.factors}"
+            )
+            
+            # ============================================================
+            # PASO 8: Construir respuesta principal CON RISK SCORING
             # ============================================================
             response = await ResponseBuilder.build_validation_response(
                 email=normalized_email,
@@ -916,6 +999,24 @@ class EmailValidationEngine:
                 breach_info=breach_info,
                 role_email_info=role_email_info,
                 spam_trap_info=spam_trap_check,
+            )
+            
+            # ========================================
+            # AGREGAR UNIFIED RISK SCORING A RESPONSE
+            # ========================================
+            response_dict = json.loads(response.body.decode())
+            response_dict["risk_assessment"] = {
+                "score": unified_risk.score,
+                "level": unified_risk.level,
+                "factors": unified_risk.factors,
+                "explanation": unified_risk.explanation,
+                "confidence": round(unified_risk.confidence, 3)
+            }
+            
+            # Actualizar response con nueva información
+            response = JSONResponse(
+                status_code=response.status_code,
+                content=response_dict
             )
                         
             await self.update_validation_metrics(request, response, plan, start_time)
@@ -1159,8 +1260,8 @@ class EmailValidationEngine:
             return VerificationResult(
                 valid=False,
                 detail=f"Domain validation service error: {str(e)[:100]}",
-                errortype="validation_error",
-                mxhost=None
+                error_type="validation_error",
+                mx_host=None
             )
 
 
@@ -1968,7 +2069,7 @@ file_validation_service = FileValidationService()
 # Endpoints Principales
 # ---------------------------
 
-from app.middleware import SAFE_CONTENT_TYPES
+from app.config import SAFE_CONTENT_TYPES
 
 async def validate_content_type(request: Request) -> str:
     """Dependency: Validar Content-Type desde middleware"""

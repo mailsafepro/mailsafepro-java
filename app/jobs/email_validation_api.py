@@ -2,7 +2,7 @@
 from __future__ import annotations
 import base64, hmac, hashlib, time, json
 from typing import Any, Dict, Optional
-import requests
+import httpx  # ✅ Migrated from requests to httpx for better performance
 
 class EmailValidationAPI:
     def __init__(self, base_url: str, api_key: str) -> None:
@@ -17,17 +17,23 @@ class EmailValidationAPI:
 
     def create_job(self, body: Dict[str, Any], idem_key: Optional[str] = None) -> Dict[str, Any]:
         headers = self._headers({"X-Idempotency-Key": idem_key} if idem_key else {})
-        r = requests.post(f"{self.base_url}/v1/jobs", headers=headers, data=json.dumps(body))
+        # ✅ Using httpx (supports both sync and async)
+        r = httpx.post(f"{self.base_url}/v1/jobs", headers=headers, json=body, timeout=30.0)
         r.raise_for_status()
         return r.json()
 
     def get_job(self, job_id: str) -> Dict[str, Any]:
-        r = requests.get(f"{self.base_url}/v1/jobs/{job_id}", headers=self._headers())
+        r = httpx.get(f"{self.base_url}/v1/jobs/{job_id}", headers=self._headers(), timeout=30.0)
         r.raise_for_status()
         return r.json()
 
     def get_results(self, job_id: str, page: int = 1, size: int = 500) -> Dict[str, Any]:
-        r = requests.get(f"{self.base_url}/v1/jobs/{job_id}/results", headers=self._headers(), params={"page": page, "size": size})
+        r = httpx.get(
+            f"{self.base_url}/v1/jobs/{job_id}/results",
+            headers=self._headers(),
+            params={"page": page, "size": size},
+            timeout=30.0
+        )
         r.raise_for_status()
         return r.json()
 

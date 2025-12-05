@@ -6,6 +6,8 @@ def setup_logging():
     def ensure_request_id(record):
         if "request_id" not in record["extra"]:
             record["extra"]["request_id"] = "no-id"
+        if "security_event" not in record["extra"]:
+            record["extra"]["security_event"] = False
 
     _loguru_logger.remove()
     patched_logger = _loguru_logger.patch(ensure_request_id)

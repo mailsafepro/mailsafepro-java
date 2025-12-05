@@ -282,9 +282,9 @@ def _extract_plan_from_jwt(request: Request) -> str:
     try:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            from jose import jwt as jose_jwt
+            import jwt as pyjwt
             token = auth_header.split(" ")[1]
-            payload = jose_jwt.get_unverified_claims(token)
+            payload = pyjwt.decode(token, options={"verify_signature": False})
             plan = payload.get("plan")
             if plan:
                 return plan.upper()
@@ -307,11 +307,11 @@ async def validation_exception_handler(
     try:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            from jose import jwt as jose_jwt  # ← CORRECTO: Usa jose
+            import jwt as pyjwt
             token = auth_header.split(" ")[1]
             
-            # ✅ MÉTODO CORRECTO: get_unverified_claims (NO decode_jwt)
-            payload = jose_jwt.get_unverified_claims(token)
+            # ✅ MÉTODO CORRECTO: decode con verify_signature=False
+            payload = pyjwt.decode(token, options={"verify_signature": False})
             plan = payload.get("plan")
             
             if plan:
@@ -377,11 +377,11 @@ async def _get_client_plan_safe(request: Request) -> str:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             try:
-                from jose import jwt as jose_jwt  # Usa la librería correcta
+                import jwt as pyjwt
                 token = auth_header.split(" ")[1]
                 
                 # Decodifica sin verificar (porque ya fue verificado en middleware)
-                payload = jose_jwt.get_unverified_claims(token)
+                payload = pyjwt.decode(token, options={"verify_signature": False})
                 plan = payload.get("plan")
                 if plan:
                     return plan.upper()
@@ -426,11 +426,20 @@ def _format_validation_errors(errors: list) -> list:
     formatted = []
     
     for error in errors:
+        input_value = error.get("input") if "input" in error else None
+        
+        # Handle bytes input (e.g. from non-JSON bodies)
+        if isinstance(input_value, bytes):
+            try:
+                input_value = input_value.decode("utf-8", errors="replace")
+            except Exception:
+                input_value = str(input_value)
+                
         formatted.append({
             "field": ".".join(str(loc) for loc in error.get("loc", [])),
             "message": error.get("msg", "validation error"),
             "type": error.get("type", "unknown"),
-            "input": error.get("input") if "input" in error else None
+            "input": input_value
         })
     
     return formatted

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 
 import stripe
-from jose import jwt
+import jwt  # PyJWT
 from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks, Body
 from pydantic import BaseModel, Field, field_validator
 from redis.asyncio import Redis
@@ -910,7 +910,7 @@ async def change_plan(
         scopes=scopes
     )
 
-    refresh_payload = jwt.get_unverified_claims(new_refresh_token)
+    refresh_payload = jwt.decode(new_refresh_token, options={"verify_signature": False})
     await store_refresh_token(refresh_payload["jti"], refresh_exp, redis)
 
     logger.info(f"Plan changed to {plan} for user {user_id}, new tokens generated")

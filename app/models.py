@@ -23,6 +23,7 @@ from pydantic import (
     field_validator,
     model_validator,
     ValidationInfo,
+    constr,
 )
 
 # --------------------------
@@ -102,21 +103,26 @@ class EmailValidationRequest(BaseAPIModel):
         }
     )
 
-    email: str = Field(
+    email: constr(min_length=3, max_length=320, strip_whitespace=True) = Field(
         ...,
-        description="Email address to validate",
-        min_length=1,             # rebajado de 5 a 1 para dejar la semántica al motor
-        max_length=254,
-        examples=["user@example.com"],
+        description="Email address to validate (RFC 5321 compliant)"
     )
-    check_smtp: bool = Field(
-        default=False,
-        description="Perform SMTP mailbox verification",
-    )
-    include_raw_dns: bool = Field(
-        default=False,
-        description="Include raw DNS records in response",
-    )
+    check_smtp: bool = Field(default=False, description="Enable SMTP mailbox verification")
+    include_raw_dns: bool = Field(default=False, description="Include raw DNS records")
+    
+    @field_validator('email')
+    def validate_email_format(cls, v):
+        """
+        Strict email validation to prevent injection attacks.
+        
+        Validates:
+        - No dangerous characters (<, >, ", \\, newlines, etc.)
+        - Exactly one @ symbol
+        - RFC 5321 length limits (local <= 64, domain <= 255)
+        - Basic format compliance
+        """
+        from app.security.input_validation import validate_email_strict
+        return validate_email_strict(v)
     priority: PriorityEnum = Field(
         default=PriorityEnum.standard,
         description="Validation priority level",

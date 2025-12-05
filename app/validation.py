@@ -14,6 +14,7 @@ import time
 import threading
 import ipaddress
 import smtplib
+from app.resilience.per_host_breaker import PerHostCircuitBreaker
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -57,7 +58,7 @@ except Exception:
 # Dependencias del proyecto (deben existir en tu app)
 from app.logger import logger
 from app.config import settings
-from app.cache import AsyncTTLCache  # caché asíncrona en memoria
+from app.cache import AsyncTTLCache, UnifiedCache  # Unified Cache + L1
 
 # ---------------------------
 # Configuración y Constantes
@@ -192,43 +193,7 @@ class SMTPTestResult:
 # Circuit Breaker
 # ---------------------------
 
-class SMTPCircuitBreaker:
-    """
-    Circuit breaker por host MX para evitar insistir en destinos que fallan repetidamente.
-    """
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 300) -> None:
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self._failures: Dict[str, List[datetime]] = defaultdict(list)
-        self._lock = asyncio.Lock()
-
-    async def record_failure(self, mx_host: str) -> None:
-        async with self._lock:
-            now = datetime.utcnow()
-            self._failures[mx_host].append(now)
-            self._clean_old_failures(mx_host, now)
-
-    async def is_open(self, mx_host: str) -> bool:
-        async with self._lock:
-            now = datetime.utcnow()
-            self._clean_old_failures(mx_host, now)
-            return len(self._failures[mx_host]) >= self.failure_threshold
-
-    def _clean_old_failures(self, mx_host: str, current_time: datetime) -> None:
-        cutoff = current_time - timedelta(seconds=self.recovery_timeout)
-        self._failures[mx_host] = [ts for ts in self._failures[mx_host] if ts > cutoff]
-
-    async def get_failure_count(self, mx_host: str) -> int:
-        async with self._lock:
-            now = datetime.utcnow()
-            self._clean_old_failures(mx_host, now)
-            return len(self._failures[mx_host])
-
-
-smtp_circuit_breaker = SMTPCircuitBreaker(
-    failure_threshold=getattr(settings, "smtp_failure_threshold", 5),
-    recovery_timeout=getattr(settings, "smtp_recovery_timeout", 300),
-)
+smtp_circuit_breaker: Optional[PerHostCircuitBreaker] = None
 
 # ---------------------------
 # Caches en memoria + Redis
@@ -245,22 +210,22 @@ def set_redis_client(redis_client: "RedisT") -> None:
     """
     Inyecta el cliente Redis opcional para cache distribuida.
     """
-    global REDIS_CLIENT
+    global REDIS_CLIENT, smtp_circuit_breaker
     REDIS_CLIENT = redis_client
+    if redis_client:
+        UnifiedCache.initialize(redis_client)
+        smtp_circuit_breaker = PerHostCircuitBreaker(
+            service_name="smtp",
+            redis_client=redis_client,
+            fail_max=getattr(settings, "smtp_failure_threshold", 5),
+            timeout_duration=getattr(settings, "smtp_recovery_timeout", 300)
+        )
 
 async def async_cache_get(key: str) -> Any:
-    if REDIS_CLIENT is not None:
-        try:
-            raw = await REDIS_CLIENT.get(key)
-            if raw is not None:
-                s = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-                try:
-                    return json.loads(s)
-                except Exception:
-                    return s
-            # Miss en Redis: continuar a fallback
-        except Exception as e:
-            logger.debug("Redis GET error for %s: %s", key, str(e))
+    # Use UnifiedCache
+    cached = await UnifiedCache.get(key)
+    if cached is not None:
+        return cached
 
     # Fallback en memoria por prefijo
     if key.startswith("mx:"):
@@ -273,21 +238,12 @@ async def async_cache_get(key: str) -> Any:
 
 
 async def async_cache_set(key: str, value: Any, ttl: Optional[int] = None) -> None:
+    # Use UnifiedCache
+    await UnifiedCache.set(key, value, ttl=ttl)
+
+    # Fallback memoria
     storable = value.to_dict() if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")) else value
-
-    if REDIS_CLIENT is not None:
-        try:
-            payload = json.dumps(storable, default=lambda o: o.__dict__ if hasattr(o, "__dict__") else str(o))
-            ex = int(ttl) if ttl is not None else None
-            if ex:
-                await REDIS_CLIENT.set(key, payload, ex=ex)
-            else:
-                await REDIS_CLIENT.set(key, payload)
-            return
-        except Exception as e:
-            logger.debug("Redis SET error for %s: %s", key, str(e))
-
-    # Fallback memoria: no pasar ttl si la implementación no lo soporta
+    
     try:
         if key.startswith("mx:"):
             await mx_cache.set(key, storable, ttl=ttl or config.mx_cache_ttl)
@@ -308,30 +264,20 @@ async def async_cache_clear(prefix: Optional[str] = None) -> None:
     """
     Limpieza de caché; en Redis usa SCAN para evitar bloqueos por KEYS.
     """
-    if REDIS_CLIENT is not None:
-        try:
-            pattern = f"{prefix}*" if prefix else "*"
-            # SCAN loop
-            cursor = 0
-            keys: List[str] = []
-            while True:
-                cursor, batch = await REDIS_CLIENT.scan(cursor=cursor, match=pattern, count=1000)
-                if batch:
-                    keys.extend(batch)
-                if cursor == 0:
-                    break
-            if keys:
-                await REDIS_CLIENT.delete(*keys)
-            return
-        except Exception as e:
-            logger.debug("Redis clear error for %s: %s", prefix, str(e))
+    # Use UnifiedCache
+    if prefix:
+        await UnifiedCache.clear(prefix)
+    else:
+        await UnifiedCache.clear()
 
-    # fallback memoria
+    # Fallback
     if not prefix:
         await mx_cache.clear()
         await domain_cache.clear()
         await smtp_cache.clear()
     else:
+        # No soportado selectivamente en fallback simple
+        pass
         if prefix.startswith("mx:"):
             await mx_cache.clear()
         if prefix.startswith("domain:"):
@@ -821,7 +767,7 @@ def _to_host_list(seq: Any) -> list[str]:
 
 async def get_mx_records(domain: str, max_records: int = 5):
     d = (domain or "").lower().strip()
-    cache_key = f"mx:{d}"
+    cache_key = UnifiedCache.build_key("mx", d)
 
     # 1) Caché de validation -> devolver MXRecord
     try:
@@ -1344,7 +1290,7 @@ async def check_smtp_mailbox_safe(email: str, max_total_time: Optional[int] = No
 
 async def cached_check_domain(domain: str) -> VerificationResult:
     norm = domain.strip().lower()
-    cache_key = f"domain:{norm}"
+    cache_key = UnifiedCache.build_key("domain", norm)
     cached = await async_cache_get(cache_key)
     if isinstance(cached, dict):
         return VerificationResult(**cached)
@@ -1395,15 +1341,91 @@ async def is_disposable_domain(domain: str, redis_client: Optional["RedisT"] = N
         logger.error("Disposable domain check failed for %s: %s", domain, str(e))
         return False
 
+
+async def detect_catch_all_domain(domain: str, mx_records: Optional[List[MXRecord]] = None) -> Dict[str, Any]:
+    """
+    Detects if a domain is configured as catch-all (accepts all email addresses).
+    Uses SMTP verification with a random non-existent user to test.
+    Caches results for 24h to avoid repeated checks.
+    """
+    domain_lower = domain.strip().lower()
+    
+    # Check cache first
+    cache_key = UnifiedCache.build_key("catch_all", domain_lower)
+    cached = await UnifiedCache.get(cache_key)
+    if cached:
+        return cached
+    
+    result = {
+        "is_catch_all": False,
+        "confidence": 0.0,
+        "details": "",
+        "method": "none"
+    }
+    
+    try:
+        # Generate random non-existent user
+        random_user = f"test_{int(time.time())}_{random.randint(1000, 9999)}"
+        test_email = f"{random_user}@{domain_lower}"
+        
+        # Perform SMTP check
+        valid, detail = await check_smtp_mailbox_safe(test_email, max_total_time=10, do_rcpt=True)
+        
+        if valid is True:
+            # If random email is valid, domain is catch-all
+            result['is_catch_all'] = True
+            result['confidence'] = 0.95
+            result['details'] = 'Domain accepts non-existent addresses (catch-all)'
+            result['method'] = 'smtp'
+        elif valid is False:
+            # Random email rejected = likely NOT catch-all
+            result['is_catch_all'] = False
+            result['confidence'] = 0.90
+            result['details'] = 'Domain rejects non-existent addresses'
+            result['method'] = 'smtp'
+        else:
+            # Inconclusive
+            result['confidence'] = 0.0
+            result['details'] = f'SMTP check inconclusive: {detail}'
+            result['method'] = 'error'
+        
+        # Cache result for 24h
+        if REDIS_CLIENT and result['confidence'] > 0.5:
+            try:
+                await UnifiedCache.set(cache_key, result, ttl=86400)  # 24h TTL
+                logger.debug(f"Cached catch-all result for {domain_lower}")
+            except Exception as e:
+                logger.debug(f"Failed to cache catch-all result: {e}")
+        
+        return result
+    
+    except asyncio.TimeoutError:
+        result['details'] = 'SMTP check timeout'
+        result['method'] = 'error'
+        logger.debug(f"Catch-all check timeout for {domain_lower}")
+        return result
+    
+    except Exception as e:
+        result['details'] = f'SMTP check error: {str(e)[:100]}'
+        result['method'] = 'error'
+        logger.debug(f"Catch-all check error for {domain_lower}: {e}")
+        return result
+
+
+
+
+
 # ---------------------------
 # Monitoreo / Stats
 # ---------------------------
 
 async def get_smtp_circuit_breaker_status() -> Dict[str, Any]:
-    return {
-        "failure_threshold": smtp_circuit_breaker.failure_threshold,
-        "recovery_timeout": smtp_circuit_breaker.recovery_timeout,
-    }
+    if smtp_circuit_breaker:
+        return {
+            "failure_threshold": smtp_circuit_breaker.fail_max,
+            "recovery_timeout": smtp_circuit_breaker.timeout_duration,
+        }
+    return {"status": "disabled"}
 
 
 async def get_cache_stats() -> Dict[str, Any]:
@@ -1426,9 +1448,9 @@ async def get_cache_stats() -> Dict[str, Any]:
             pass
     return {
         "redis_enabled": False,
-        "mx_cache": await mx_cache.stats() if hasattr(mx_cache, "stats") else "N/A",
-        "domain_cache": await domain_cache.stats() if hasattr(domain_cache, "stats") else "N/A",
-        "smtp_cache": await smtp_cache.stats() if hasattr(smtp_cache, "stats") else "N/A",
+        "mx_cache": mx_cache.stats() if hasattr(mx_cache, "stats") else "N/A",
+        "domain_cache": domain_cache.stats() if hasattr(domain_cache, "stats") else "N/A",
+        "smtp_cache": smtp_cache.stats() if hasattr(smtp_cache, "stats") else "N/A",
     }
 
 

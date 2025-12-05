@@ -1,12 +1,5 @@
 """
-metrics.py — versión corregida y endurecida
-
-Objetivos:
-- Nombres de métricas sin doble prefijo; usar namespace/subsystem del cliente Prometheus.
-- Endpoint /metrics compatible con multiproceso (Gunicorn) usando CollectorRegistry por request.
-- Control de cardinalidad: evitar user_id como etiqueta; usar plan/segmento agregados.
-- Histogramas con buckets coherentes para latencia y tamaños; sincrónicos con Instrumentator.
-- Sin acceso a response.body para tamaño; usar Content-Length cuando esté presente.
+metrics.py — Versión corregida para soporte de Singleton con argumentos y tests
 """
 
 from __future__ import annotations
@@ -16,10 +9,9 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from functools import wraps
-from typing import Dict, Any, Optional, Callable, Tuple
+from typing import Dict, Any, Optional, Callable
 
-from fastapi import FastAPI, Response, Depends, Request
-from fastapi.responses import Response as StarletteResponse
+from fastapi import FastAPI, Response, Request
 from prometheus_client import (
     Counter,
     Histogram,
@@ -29,16 +21,14 @@ from prometheus_client import (
     CollectorRegistry,
     REGISTRY,
 )
-from prometheus_fastapi_instrumentator import Instrumentator, metrics
 
-from app.auth import validate_api_key
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from app.config import get_settings
 
-# Configuración
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
-# Espacios de nombres (se aplican como parámetros, no en los nombres)
+# Espacios de nombres
 METRIC_NAMESPACE = "email_validation"
 METRIC_SUBSYSTEM_API = "api"
 METRIC_SUBSYSTEM_BUSINESS = "business"
@@ -47,41 +37,48 @@ METRIC_SUBSYSTEM_CACHE = "cache"
 METRIC_SUBSYSTEM_SYSTEM = "system"
 METRIC_SUBSYSTEM_WEBHOOKS = "webhooks"
 
-# Buckets de histogramas
+# Buckets
 LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0)
 VALIDATION_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5)
 SIZE_BUCKETS = (100, 1000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000)
 
-# Utilidad para obtener registry adecuado (multiproceso o no)
+
 def get_export_registry() -> CollectorRegistry:
-    """
-    Devuelve un CollectorRegistry apropiado para exportación de métricas.
-    - Si PROMETHEUS_MULTIPROC_DIR está definido: crear un registry por request y acoplar MultiProcessCollector.
-    - Si no: usar REGISTRY global.
-    """
+    """Devuelve un CollectorRegistry apropiado para exportación de métricas."""
     try:
-        from prometheus_client import multiprocess  # import local para evitar coste si no se usa
+        from prometheus_client import multiprocess
     except Exception:
-        multiprocess = None  # type: ignore
+        multiprocess = None
 
     if multiprocess and os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
         return registry
-    # Fallback: single-process registry global
     return REGISTRY  # type: ignore[return-value]
 
 
 class MetricsManager:
-    """Gestor centralizado de métricas."""
+    """Gestor centralizado de métricas (Singleton)."""
+    _instance = None
 
-    def __init__(self) -> None:
-        # Nota: las métricas se registran en el registry por defecto del cliente
-        # El endpoint de exportación decidirá qué registry exponer.
-        self._initialize_metrics()
+    def __new__(cls, *args, **kwargs):
+        # Aceptamos *args y **kwargs para evitar el TypeError cuando se inicializa con argumentos
+        if cls._instance is None:
+            cls._instance = super(MetricsManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
 
-    def _initialize_metrics(self) -> None:
+    def __init__(self, registry: Optional[CollectorRegistry] = None) -> None:
+        if getattr(self, "_initialized", False):
+            return
+        self._initialize_metrics(registry)
+        self._initialized = True
+
+    def _initialize_metrics(self, registry: Optional[CollectorRegistry] = None) -> None:
         """Define todas las métricas con etiquetas y documentación adecuadas."""
+        # Si se pasa un registry explícito, lo usamos.
+        reg_kw = {"registry": registry} if registry else {}
+
         # HTTP
         self.requests_total = Counter(
             "http_requests_total",
@@ -89,7 +86,9 @@ class MetricsManager:
             ["method", "endpoint", "status_code", "client_plan"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_API,
+            **reg_kw
         )
+
         self.request_duration = Histogram(
             "http_request_duration_seconds",
             "HTTP request duration in seconds",
@@ -97,7 +96,9 @@ class MetricsManager:
             buckets=LATENCY_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_API,
+            **reg_kw
         )
+
         self.request_size_bytes = Histogram(
             "http_request_size_bytes",
             "HTTP request size in bytes",
@@ -105,7 +106,9 @@ class MetricsManager:
             buckets=SIZE_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_API,
+            **reg_kw
         )
+
         self.response_size_bytes = Histogram(
             "http_response_size_bytes",
             "HTTP response size in bytes",
@@ -113,6 +116,7 @@ class MetricsManager:
             buckets=SIZE_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_API,
+            **reg_kw
         )
 
         # Negocio
@@ -122,7 +126,9 @@ class MetricsManager:
             ["validation_type", "result", "client_plan"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
+
         self.validation_duration = Histogram(
             "validation_duration_seconds",
             "Email validation processing time",
@@ -130,6 +136,7 @@ class MetricsManager:
             buckets=VALIDATION_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
 
         # SMTP
@@ -139,7 +146,9 @@ class MetricsManager:
             ["status", "mx_host_group"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_SMTP,
+            **reg_kw
         )
+
         self.smtp_check_duration = Histogram(
             "smtp_check_duration_seconds",
             "SMTP verification duration",
@@ -147,6 +156,7 @@ class MetricsManager:
             buckets=LATENCY_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_SMTP,
+            **reg_kw
         )
 
         # Cache
@@ -156,13 +166,16 @@ class MetricsManager:
             ["operation", "cache_type", "result"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_CACHE,
+            **reg_kw
         )
+
         self.cache_hit_ratio = Gauge(
             "cache_hit_ratio",
             "Cache hit ratio",
             ["cache_type"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_CACHE,
+            **reg_kw
         )
 
         # Sistema
@@ -172,31 +185,36 @@ class MetricsManager:
             ["service"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_SYSTEM,
+            **reg_kw
         )
+
         self.error_total = Counter(
             "errors_total",
             "Total errors by type",
             ["error_type", "severity", "component"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_SYSTEM,
+            **reg_kw
         )
 
-        # Concurrencia de validaciones (sin user_id para evitar alta cardinalidad)
+        # Concurrencia
         self.concurrent_validations = Gauge(
             "concurrent_validations",
             "Number of concurrent validation processes",
             ["plan"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
 
-        # Uso de cuota (evitar user_id; usar plan o segmento de cliente)
+        # Cuota
         self.quota_usage = Gauge(
             "quota_usage_ratio",
             "Current quota usage ratio (0..1)",
             ["plan"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
 
         # Jobs
@@ -206,7 +224,9 @@ class MetricsManager:
             ["event", "plan"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
+
         self.job_duration_seconds = Histogram(
             "job_duration_seconds",
             "Job end-to-end processing time",
@@ -214,13 +234,16 @@ class MetricsManager:
             buckets=LATENCY_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
+
         self.job_queue_depth = Gauge(
             "job_queue_depth",
             "Current jobs queue depth",
             ["queue"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
 
         # Webhooks
@@ -230,7 +253,9 @@ class MetricsManager:
             ["status_class"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_WEBHOOKS,
+            **reg_kw
         )
+
         self.webhook_delivery_duration = Histogram(
             "webhook_delivery_duration_seconds",
             "Webhook delivery duration in seconds",
@@ -238,20 +263,43 @@ class MetricsManager:
             buckets=LATENCY_BUCKETS,
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_WEBHOOKS,
+            **reg_kw
         )
+
         self.webhook_retries_total = Counter(
             "webhook_retries_total",
             "Total webhook retries by reason",
             ["reason"],
             namespace=METRIC_NAMESPACE,
             subsystem=METRIC_SUBSYSTEM_WEBHOOKS,
+            **reg_kw
+        )
+
+        # ARQ Specific
+        self.arq_jobs_queued_total = Counter(
+            "arq_jobs_queued_total",
+            "Total jobs enqueued in ARQ",
+            ["queue_name", "task_name"],
+            namespace=METRIC_NAMESPACE,
+            subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
+        )
+
+        self.arq_jobs_processed_total = Counter(
+            "arq_jobs_processed_total",
+            "Total jobs processed by ARQ",
+            ["queue_name", "task_name", "status"],
+            namespace=METRIC_NAMESPACE,
+            subsystem=METRIC_SUBSYSTEM_BUSINESS,
+            **reg_kw
         )
 
 
-class MetricLabelNormalizer:
-    """Normaliza y sanitiza etiquetas para Prometheus (evitando alta cardinalidad)."""
 
+class MetricLabelNormalizer:
+    """Normaliza y sanitiza etiquetas para Prometheus."""
     HIGH_CARDINALITY_FIELDS = {"user_id", "email", "ip_address", "trace_id", "session_id"}
+    
     FIELD_GROUPS = {
         "mx_host": lambda host: ".".join(host.split(".")[-2:]) if "." in host else "unknown",
         "error_type": lambda error: error.split(":")[0] if ":" in error else error,
@@ -263,12 +311,15 @@ class MetricLabelNormalizer:
     def normalize_label(cls, label_name: str, value: Any) -> str:
         if value is None:
             return "unknown"
+        
         normalized = str(value).strip().lower()
+        
         if label_name in cls.FIELD_GROUPS:
             try:
                 normalized = cls.FIELD_GROUPS[label_name](normalized)
             except Exception:
                 normalized = "unknown"
+        
         normalized = (
             normalized.replace(" ", "_")
             .replace("-", "_")
@@ -278,6 +329,7 @@ class MetricLabelNormalizer:
             .replace("\\", "_")
             .replace("@", "_at_")
         )
+        
         normalized = "_".join(filter(None, normalized.split("_")))[:64]
         return normalized or "unknown"
 
@@ -313,27 +365,28 @@ class SafeMetricsRecorder:
                 "status_code": str(status_code),
                 "client_plan": self.normalizer.normalize_label("client_plan", client_plan),
             }
-            # Conteo
+
             self._safe_increment(self.metrics.requests_total, labels)
-            # Duración
             self._safe_observe(
                 self.metrics.request_duration,
                 duration,
                 {"method": labels["method"], "endpoint": labels["endpoint"], "status_code": labels["status_code"]},
             )
-            # Tamaños
+
             if request_size > 0:
                 self._safe_observe(
                     self.metrics.request_size_bytes,
                     float(request_size),
                     {"method": labels["method"], "endpoint": labels["endpoint"]},
                 )
+            
             if response_size > 0:
                 self._safe_observe(
                     self.metrics.response_size_bytes,
                     float(response_size),
                     {"method": labels["method"], "endpoint": labels["endpoint"], "status_code": labels["status_code"]},
                 )
+
         except Exception as e:
             logger.warning("Failed to record HTTP metrics: %s", e)
 
@@ -344,6 +397,7 @@ class SafeMetricsRecorder:
                 "result": self.normalizer.normalize_label("result", result),
                 "client_plan": self.normalizer.normalize_label("client_plan", client_plan),
             }
+            
             self._safe_increment(self.metrics.validations_total, labels)
             self._safe_observe(
                 self.metrics.validation_duration,
@@ -367,6 +421,21 @@ class SafeMetricsRecorder:
             )
         except Exception as e:
             logger.warning("Failed to record SMTP metrics: %s", e)
+
+    def record_arq_job_event(self, queue_name: str, task_name: str, event: str) -> None:
+        try:
+            if event == "queued":
+                self._safe_increment(
+                    self.metrics.arq_jobs_queued_total,
+                    {"queue_name": queue_name, "task_name": task_name}
+                )
+            elif event in ("completed", "failed"):
+                self._safe_increment(
+                    self.metrics.arq_jobs_processed_total,
+                    {"queue_name": queue_name, "task_name": task_name, "status": event}
+                )
+        except Exception as e:
+            logger.warning("Failed to record ARQ metrics: %s", e)
 
     def record_cache_operation(self, operation: str, cache_type: str, result: str) -> None:
         try:
@@ -394,22 +463,6 @@ class SafeMetricsRecorder:
         except Exception as e:
             logger.warning("Failed to record error metrics: %s", e)
 
-    def _safe_increment(self, counter: Counter, labels: Dict[str, str]) -> None:
-        try:
-            label_names = getattr(counter, "_labelnames", [])
-            filtered = {name: labels.get(name, "unknown") for name in label_names}
-            counter.labels(**filtered).inc()
-        except Exception as e:
-            logger.warning("Failed to increment counter %s: %s", getattr(counter, "_name", "unknown"), e)
-
-    def _safe_observe(self, histogram: Histogram, value: float, labels: Dict[str, str]) -> None:
-        try:
-            label_names = getattr(histogram, "_labelnames", [])
-            filtered = {name: labels.get(name, "unknown") for name in label_names}
-            histogram.labels(**filtered).observe(value)
-        except Exception as e:
-            logger.warning("Failed to observe histogram %s: %s", getattr(histogram, "_name", "unknown"), e)
-
     def record_job_event(self, plan: str, event: str) -> None:
         try:
             plan_norm = self.normalizer.normalize_label("client_plan", plan)
@@ -434,7 +487,6 @@ class SafeMetricsRecorder:
 
     def record_webhook_delivery(self, status_code: int, duration: float) -> None:
         try:
-            # agrupa por clase 2xx/4xx/5xx
             sc = str(int(status_code))
             status_class = f"{sc[0]}xx" if len(sc) == 3 and sc.isdigit() else "other"
             self.metrics.webhook_deliveries_total.labels(status_class=status_class).inc()
@@ -449,11 +501,26 @@ class SafeMetricsRecorder:
         except Exception as e:
             logger.warning("Failed to record webhook retry: %s", e)
 
+    def _safe_increment(self, counter: Counter, labels: Dict[str, str]) -> None:
+        try:
+            label_names = getattr(counter, "_labelnames", [])
+            filtered = {name: labels.get(name, "unknown") for name in label_names}
+            counter.labels(**filtered).inc()
+        except Exception as e:
+            logger.warning("Failed to increment counter %s: %s", getattr(counter, "_name", "unknown"), e)
 
-# ---- exporta utilidades de montaje ----
+    def _safe_observe(self, histogram: Histogram, value: float, labels: Dict[str, str]) -> None:
+        try:
+            label_names = getattr(histogram, "_labelnames", [])
+            filtered = {name: labels.get(name, "unknown") for name in label_names}
+            histogram.labels(**filtered).observe(value)
+        except Exception as e:
+            logger.warning("Failed to observe histogram %s: %s", getattr(histogram, "_name", "unknown"), e)
+
+
 def mount_metrics_endpoint(app: FastAPI) -> None:
     @app.get("/metrics", include_in_schema=False)
-    async def metrics_endpoint(request: Request):  # scraping sin auth
+    async def metrics_endpoint(request: Request): 
         try:
             registry = get_export_registry()
             data = generate_latest(registry)
@@ -482,8 +549,6 @@ def instrument_app(app: FastAPI) -> None:
         inprogress_labels=True,
     )
 
-    # Compatibilidad: si tu versión da error con metric_namespace/metric_subsystem, elimina esos kwargs
-    # Métricas estándar con buckets y namespace/subsystem
     instrumentator.add(
         metrics.request_size(
             should_include_handler=True,
@@ -518,48 +583,17 @@ def instrument_app(app: FastAPI) -> None:
         )
     )
 
-    # Agregar histogramas personalizados con buckets específicos
-    @instrumentator.instrument
-    def custom_histograms(response: Response):
-        # Esta función se ejecutará después de cada request y puedes agregar métricas personalizadas aquí
-        # Pero los buckets ya están definidos en las métricas que creamos manualmente en MetricsManager
-        pass
-    
-
-    # Importante: no expongas aquí si montarás tu propio endpoint /metrics
     instrumentator.instrument(app)
     logger.info("Application instrumentation completed")
 
 
-def mount_metrics_endpoint(app: FastAPI) -> None:
-    @app.get("/metrics", include_in_schema=False)
-    async def metrics_endpoint(request: Request):  # <- quita Depends(validate_api_key) si quieres scraping sin auth
-        try:
-            registry = get_export_registry()
-            data = generate_latest(registry)
-            return Response(
-                content=data,
-                media_type=CONTENT_TYPE_LATEST,
-                headers={
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Pragma": "no-cache",
-                    "Expires": "0",
-                },
-            )
-        except Exception as e:
-            logger.error("Metrics generation failed: %s", e)
-            return Response(content=b"", status_code=500, media_type=CONTENT_TYPE_LATEST)
-
-
 async def metrics_middleware(request: Request, call_next: Callable[..., Any]):
     start_time = time.time()
-
     try:
         request_size = int(request.headers.get("content-length", "0")) if request.headers.get("content-length") else 0
     except Exception:
         request_size = 0
 
-    # Procesa la petición; si falla, registra 500 y repropaga
     try:
         response = await call_next(request)
     except Exception:
@@ -577,12 +611,11 @@ async def metrics_middleware(request: Request, call_next: Callable[..., Any]):
         raise
 
     duration = time.time() - start_time
-
     try:
         response_size = int(response.headers.get("content-length", "0")) if response.headers.get("content-length") else 0
     except Exception:
         response_size = 0
-
+        
     metrics_recorder.record_http_request(
         method=request.method,
         endpoint=request.url.path,
@@ -592,8 +625,8 @@ async def metrics_middleware(request: Request, call_next: Callable[..., Any]):
         request_size=request_size,
         response_size=response_size,
     )
-
     return response
+
 
 def track_validation_metrics(validation_type: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator para medir duración y resultado de validaciones."""
@@ -618,7 +651,7 @@ def track_validation_metrics(validation_type: str) -> Callable[[Callable[..., An
 
 class PerformanceMonitor:
     """Utilidades simples de monitorización de rendimiento."""
-
+    
     @staticmethod
     @asynccontextmanager
     async def measure_operation(operation_name: str, labels: Optional[Dict[str, str]] = None):
@@ -631,7 +664,6 @@ class PerformanceMonitor:
 
     @staticmethod
     def set_concurrent_validations(plan: str, count: int) -> None:
-        """Ajusta el número de validaciones concurrentes actuales por plan."""
         try:
             plan_norm = MetricLabelNormalizer.normalize_label("client_plan", plan)
             metrics_manager.concurrent_validations.labels(plan=plan_norm).set(count)
@@ -640,12 +672,13 @@ class PerformanceMonitor:
 
     @staticmethod
     def update_quota_usage(plan: str, usage_ratio: float) -> None:
-        """Actualiza la ratio de uso de cuota (0..1) por plan."""
         try:
             plan_norm = MetricLabelNormalizer.normalize_label("client_plan", plan)
             metrics_manager.quota_usage.labels(plan=plan_norm).set(float(max(0.0, min(1.0, usage_ratio))))
         except Exception as e:
             logger.warning("Failed to update quota usage: %s", e)
 
+
+# Instancia global por defecto
 metrics_manager = MetricsManager()
 metrics_recorder = SafeMetricsRecorder(metrics_manager)

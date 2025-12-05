@@ -29,6 +29,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.validations.temp_mail_domains import DISPOSABLE_DOMAINS as STATIC_DISPOSABLE_DOMAINS
 
 
+SAFE_CONTENT_TYPES = [
+    "application/json",
+    "multipart/form-data",
+    "application/x-www-form-urlencoded",
+]
+
 class EnvironmentEnum(str, Enum):
     """Application environment types"""
     DEVELOPMENT = "development"
@@ -62,7 +68,7 @@ class SecuritySettings(BaseSettings):
         ge=0,
     )
     webhook_secret: SecretStr = Field(
-        default=SecretStr("test_webhook_secret"),  # AGREGAR default
+        ...,  # ❌ NO DEFAULT - Must be provided
         description="HMAC secret for webhook verification",
         alias="SECURITY_WEBHOOK_SECRET"
     )
@@ -70,6 +76,17 @@ class SecuritySettings(BaseSettings):
         default=["localhost", "127.0.0.1"],
         description="Allowed host headers for security",
     )
+
+    @model_validator(mode="after")
+    def validate_production_secrets(self) -> "SecuritySettings":
+        """Enforce strong secrets in production"""
+        # We can't easily check environment here as it's in parent Settings, 
+        # but we can ensure the value is not a placeholder if provided.
+        secret = self.webhook_secret.get_secret_value()
+        if secret == "test_webhook_secret" or len(secret) < 16:
+             # In a real scenario we might raise ValueError, but to avoid breaking dev:
+             warnings.warn("Weak webhook_secret detected. Use a strong secret in production.")
+        return self
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -637,8 +654,9 @@ def _rebuild_all_models():
         APIDocumentationSettings.model_rebuild()
         MonitoringSettings.model_rebuild()
         Settings.model_rebuild()
-    except Exception:
-        pass
+    except Exception as e:
+        # Log warning but don't crash on rebuild (circular imports sometimes cause this)
+        warnings.warn(f"Model rebuild failed: {e}")
 
 _rebuild_all_models()
 

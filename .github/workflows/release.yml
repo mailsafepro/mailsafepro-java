@@ -1,0 +1,89 @@
+# Auto-Release Workflow
+# Automatically creates releases and updates CHANGELOG
+
+name: Auto Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get all history for changelog generation
+
+      - name: Generate changelog
+        id: changelog
+        uses: metcalfc/changelog-generator@v4.1.0
+        with:
+          myToken: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          release_name: MailSafePro ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## 🚀 What's New in ${{ steps.version.outputs.VERSION }}
+            
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ## 📦 Docker Images
+            
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
+            ```
+            
+            ## 📚 Documentation
+            
+            - [API Documentation](https://api.mailsafepro.com/docs)
+            - [Full Changelog](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+            
+            ## ⚙️ Installation
+            
+            ```bash
+            # Using Docker
+            docker run -p 8000:8000 ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
+            
+            # Using Kubernetes
+            kubectl apply -f https://raw.githubusercontent.com/${{ github.repository }}/main/k8s/deployment.yaml
+            ```
+          draft: false
+          prerelease: false
+
+      - name: Notify Slack
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "🎉 New MailSafePro release: ${{ steps.version.outputs.VERSION }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*MailSafePro ${{ steps.version.outputs.VERSION }}* has been released!\n\n<https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.VERSION }}|View Release Notes>"
+                  }
+                }
+              ]
+            }
+        continue-on-error: true

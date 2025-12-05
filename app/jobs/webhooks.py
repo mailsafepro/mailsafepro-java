@@ -53,34 +53,36 @@ def _is_url_safe(u: str) -> bool:
 async def send_webhook(url: str, secret: str, payload: Dict[str, Any], event_id: str) -> None:
     if not _is_url_safe(url):
         raise ValueError("Unsafe callback_url")
-    backoff = 0.5
+    
+    # Single attempt, let ARQ handle retries
+    headers = build_headers(secret, payload, event_id)
+    t0 = time.time()
+    
     async with httpx.AsyncClient(timeout=TIMEOUT_SEC, follow_redirects=False) as client:
-        for attempt in range(0, MAX_RETRIES + 1):
-            headers = build_headers(secret, payload, event_id, retry_count=attempt)
-            t0 = time.time()
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+            dur = time.time() - t0
+            
             try:
-                resp = await client.post(url, json=payload, headers=headers)
-                dur = time.time() - t0
-                try:
-                    metrics_recorder.record_webhook_delivery(resp.status_code, dur)
-                except Exception:
-                    pass
-
-                if 200 <= resp.status_code < 300 or resp.status_code == 410:
-                    return
-                if resp.status_code in (408, 425, 429, 500, 502, 503, 504):
-                    try:
-                        metrics_recorder.record_webhook_retry("retryable_status")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 30) + (os.getpid() % 100) / 1000.0
-                    continue
-                return
+                metrics_recorder.record_webhook_delivery(resp.status_code, dur)
             except Exception:
-                try:
-                    metrics_recorder.record_webhook_retry("network_error")
-                except Exception:
-                    pass
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                pass
+
+            # Raise for retryable status codes
+            if resp.status_code in (408, 425, 429, 500, 502, 503, 504):
+                raise httpx.HTTPStatusError(
+                    f"Retryable status code: {resp.status_code}", 
+                    request=resp.request, 
+                    response=resp
+                )
+                
+            # Raise for other errors if needed, or just log
+            resp.raise_for_status()
+            
+        except Exception as e:
+            # Record failure metric
+            try:
+                metrics_recorder.record_webhook_retry("error")
+            except Exception:
+                pass
+            raise e

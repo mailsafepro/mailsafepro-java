@@ -5,7 +5,7 @@ groups:
       - alert: HighValidationLatencyP99
         expr: histogram_quantile(0.99, sum by (le) (rate(email_validation_business_validation_duration_seconds_bucket[10m]))) > 5
         for: 10m
-        labels: {severity: page}
+        labels: {severity: critical}
         annotations:
           summary: "P99 validación > 5s (10m)"
       - alert: HighQueueDepthV2
@@ -13,5 +13,5 @@ groups:
                 max_over_time(email_validation_business_job_queue_depth{instance=~"worker:.*"}[2m])
               ) > 100
         for: 5m
-        labels: {severity: warn}
+        labels: {severity: warning}
         annotations: {summary: "Profundidad de cola sostenida > 100 (≥5m)"}

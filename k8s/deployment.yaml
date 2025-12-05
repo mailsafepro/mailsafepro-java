@@ -1,0 +1,330 @@
+# Kubernetes Deployment for MailSafePro API
+# Production-ready configuration with autoscaling, health checks, and resource limits
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mailsafepro
+  labels:
+    name: mailsafepro
+    environment: production
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mailsafepro-config
+  namespace: mailsafepro
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  LOG_JSON_FORMAT: "true"
+  STRUCTURED_LOGGING_ENABLED: "true"
+  
+  # Tracing
+  TRACING_ENABLED: "true"
+  TRACING_EXPORTER: "otlp"
+  TRACING_SAMPLE_RATE: "0.1"  # 10% sampling in production
+  
+  # Connection pooling
+  REDIS_MAX_CONNECTIONS: "100"
+  HTTP_MAX_CONNECTIONS: "200"
+  
+  # Rate limiting
+  ENABLE_ADVANCED_RATE_LIMITING: "true"
+  
+  # Cache warming
+  CACHE_WARMING_ENABLED: "true"
+
+---
+# Secret for sensitive data (replace with actual secrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mailsafepro-secrets
+  namespace: mailsafepro
+type: Opaque
+stringData:
+  REDIS_URL: "rediss://your-redis-host:6379"
+  DATABASE_URL: "postgresql://user:pass@host:5432/db"
+  JWT_SECRET_KEY: "your-jwt-secret-here"
+  JWT_REFRESH_SECRET_KEY: "your-refresh-secret-here"
+  STRIPE_SECRET_KEY: "sk_live_your_stripe_key"
+  STRIPE_WEBHOOK_SECRET: "whsec_your_webhook_secret"
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailsafepro-api
+  namespace: mailsafepro
+  labels:
+    app: mailsafepro-api
+    version: v2.1.0
+spec:
+  replicas: 3  # Start with 3 replicas for HA
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime deployments
+  selector:
+    matchLabels:
+      app: mailsafepro-api
+  template:
+    metadata:
+      labels:
+        app: mailsafepro-api
+        version: v2.1.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # Init container for migrations (if needed)
+      initContainers:
+        - name: wait-for-redis
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -u $REDIS_URL ping; do
+                echo "Waiting for Redis..."
+                sleep 2
+              done
+          envFrom:
+            - secretRef:
+                name: mailsafepro-secrets
+      
+      containers:
+        - name: api
+          image: mailsafepro/api:2.1.0  # Replace with your registry
+          imagePullPolicy: Always
+          
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          
+          # Environment variables from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: mailsafepro-config
+            - secretRef:
+                name: mailsafepro-secrets
+          
+          # Resource limits (adjust based on load testing)
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          
+          # Liveness probe - restart if fails
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          
+          # Readiness probe - remove from load balancer if fails
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 2
+          
+          # Startup probe - for slow-starting containers
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30  # 30 * 5 = 150s max startup time
+          
+          # Security
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          
+          # Volume mounts for tmp (read-only root filesystem)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+      
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+      
+      # Pod anti-affinity for HA (spread across nodes)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - mailsafepro-api
+                topologyKey: kubernetes.io/hostname
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailsafepro-api
+  namespace: mailsafepro
+  labels:
+    app: mailsafepro-api
+spec:
+  type: ClusterIP
+  selector:
+    app: mailsafepro-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  sessionAffinity: None  # Stateless service
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mailsafepro-api-hpa
+  namespace: mailsafepro
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mailsafepro-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    # CPU-based scaling
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory-based scaling
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5min before scaling down
+      policies:
+        - type: Percent
+          value: 10  # Max 10% pods down at once
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Scale up immediately
+      policies:
+        - type: Percent
+          value: 100  # Can double pods at once
+          periodSeconds: 30
+        - type: Pods
+          value: 4  # Or add up to 4 pods at once
+          periodSeconds: 30
+      selectPolicy: Max  # Use most aggressive policy
+
+---
+# Pod Disruption Budget (ensure availability during updates)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mailsafepro-api-pdb
+  namespace: mailsafepro
+spec:
+  minAvailable: 2  # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: mailsafepro-api
+
+---
+# Network Policy (optional - restrict traffic)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mailsafepro-api-netpol
+  namespace: mailsafepro
+spec:
+  podSelector:
+    matchLabels:
+      app: mailsafepro-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Allow external HTTPS (for SMTP, external APIs)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 25
+        - protocol: TCP
+          port: 587

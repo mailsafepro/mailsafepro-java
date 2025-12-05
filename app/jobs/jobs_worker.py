@@ -1,17 +1,27 @@
+# jobs_worker.py — ARQ worker for batch email validation
+
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import os
 import time
-from types import SimpleNamespace
+import traceback
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-from prometheus_client import start_http_server
-from app.config import get_settings
-from app.logger import logger
-from app.metrics import metrics_recorder
+from types import SimpleNamespace # Kept from original, not in instruction's snippet but needed for _StubRequest
+from prometheus_client import start_http_server # Kept from original, not in instruction's snippet
+from arq.connections import RedisSettings  # type: ignore
 from redis.asyncio import Redis
+
+import hashlib # Added from instruction's snippet
+import hmac # Added from instruction's snippet
+import httpx # Added from instruction's snippet
+
+from app.logger import logger
+from app.config import get_settings # Kept get_settings as it's used, instruction's snippet had 'settings' directly
+from app.metrics import metrics_recorder # Kept from original, not in instruction's snippet
+from app.json_utils import dumps as json_dumps, loads as json_loads_recorder # Replaced orjson
 from app.routes.validation_routes import validation_engine, validation_service
 from app.utils import increment_usage
 from app.jobs.webhooks import send_webhook
@@ -49,7 +59,7 @@ async def _load_emails_for_job(redis, payload: Dict[str, Any]) -> List[str]:
         if not raw:
             raise ValueError("Upload token not found or expired")
         try:
-            emails = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+            emails = json_loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
         except Exception:
             emails = []
         if not isinstance(emails, list):
@@ -63,18 +73,18 @@ async def _set_meta(redis, job_id: str, patch: Dict[str, Any]) -> Dict[str, Any]
     meta: Dict[str, Any] = {}
     if raw:
         try:
-            meta = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+            meta = json_loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
         except Exception:
             meta = {}
     meta.update(patch or {})
     ttl = int(meta.get("retention_seconds", RETENTION_SECONDS_DEFAULT) or RETENTION_SECONDS_DEFAULT)
-    await redis.set(meta_key, json.dumps(meta), ex=ttl)
+    await redis.set(meta_key, json_dumps(meta), ex=ttl)
     return meta
 
 async def _write_page(redis, job_id: str, page_index: int, total_pages: int, results: List[Dict[str, Any]]) -> None:
     key = f"jobs:{job_id}:results:page:{page_index}"
     payload = {"total_pages": int(total_pages), "results": results}
-    await redis.set(key, json.dumps(payload), ex=RETENTION_SECONDS_DEFAULT)
+    await redis.set(key, json_dumps(payload), ex=RETENTION_SECONDS_DEFAULT)
 
 def _sandbox_result(email: str) -> Dict[str, Any]:
     e = (email or "").lower().strip()

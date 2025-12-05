@@ -15,6 +15,7 @@ import time
 import ipaddress
 import threading
 import textwrap
+from dataclasses import asdict
 from datetime import datetime
 from contextlib import asynccontextmanager
 from collections import OrderedDict, defaultdict
@@ -34,6 +35,7 @@ from typing import (
 import aiodns
 from ipwhois import IPWhois
 from app.validation import get_mx_records, dns_resolver, check_smtp_mailbox_safe
+from app.cache import UnifiedCache, AsyncTTLCache  # Unified Cache + AsyncTTLCache
 
 async def query_mx_with_pref(domain: str):
     mx = await dns_resolver.query_mx_async(domain)
@@ -214,6 +216,7 @@ config = ProviderConfig.from_settings()
 CACHE_MX = "mx:"
 CACHE_IP = "ip:"
 CACHE_ASN = "asn:"
+CACHE_DKIM = "dkim:"
 CACHE_REP = "reputation:"
 
 # -----------------------
@@ -234,95 +237,15 @@ else:
     MET_DNS_FAILURES = MET_WHOIS_FAILURES = MET_CACHE_HITS = MET_CACHE_MISSES = MET_LATENCY = MET_RETRY_ATTEMPTS = MET_WHOIS_BLOCKED = _Dummy()
 
 # -----------------------
-# Cache con estadísticas (thread-safe) - in-memory fallback
+# -----------------------
+# In-memory caches (AsyncTTLCache)
 # -----------------------
 
-class TTLCache:
-    def __init__(self, maxsize: int = 1000, ttl: int = 3600):
-        self.maxsize = maxsize
-        self.ttl = ttl
-        self._data: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
-        self._hits = 0
-        self._misses = 0
-        self._last_purge = time.time()
-        self._lock = threading.RLock()
-
-    def _purge(self) -> None:
-        now = time.time()
-        if now - self._last_purge < 10 and len(self._data) <= self.maxsize:
-            return
-        self._last_purge = now
-        expired_keys = [k for k, (_v, ex) in list(self._data.items()) if ex <= now]
-        for key in expired_keys:
-            self._data.pop(key, None)
-        while len(self._data) > self.maxsize:
-            try:
-                self._data.popitem(last=False)
-            except Exception:
-                break
-
-    def get(self, key: str, default: Any = None) -> Any:
-        with self._lock:
-            # purgar siempre expirados, no solo cada 10s
-            now = time.time()
-            expired_keys = [k for k, (_v, ex) in list(self._data.items()) if ex <= now]
-            for k in expired_keys:
-                self._data.pop(k, None)
-
-            # mantener eviction por tamaño como está
-            while len(self._data) > self.maxsize:
-                try:
-                    self._data.popitem(last=False)
-                except Exception:
-                    break
-
-            item = self._data.get(key)
-            if item is not None:
-                self._hits += 1
-                value, _ex = item
-                try:
-                    self._data.move_to_end(key)
-                except Exception:
-                    pass
-                MET_CACHE_HITS.inc()
-                return value
-
-            self._misses += 1
-            MET_CACHE_MISSES.inc()
-            return default
-
-
-    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
-        with self._lock:
-            self._purge()
-            ex = time.time() + (ttl if ttl is not None else self.ttl)
-            self._data[key] = (value, ex)
-            try:
-                self._data.move_to_end(key)
-            except Exception:
-                pass
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
-            self._hits = 0
-            self._misses = 0
-
-    def stats(self) -> Dict[str, Any]:
-        with self._lock:
-            total = self._hits + self._misses
-            return {
-                "size": len(self._data),
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_ratio": (self._hits / total) if total > 0 else 0.0,
-            }
-
-# In-memory caches
-MX_CACHE = TTLCache(maxsize=config.general_cache_maxsize, ttl=config.mx_cache_ttl)
-MX_IP_CACHE = TTLCache(maxsize=config.general_cache_maxsize, ttl=config.ip_cache_ttl)
-ASN_CACHE = TTLCache(maxsize=config.general_cache_maxsize, ttl=config.asn_cache_ttl)
-GENERAL_CACHE = TTLCache(maxsize=config.general_cache_maxsize, ttl=config.general_cache_ttl)
+# Migrated from sync TTLCache to async AsyncTTLCache for consistency
+MX_CACHE = AsyncTTLCache(maxsize=config.general_cache_maxsize, ttl=config.mx_cache_ttl, name="mx")
+MX_IP_CACHE = AsyncTTLCache(maxsize=config.general_cache_maxsize, ttl=config.ip_cache_ttl, name="mx_ip")
+ASN_CACHE = AsyncTTLCache(maxsize=config.general_cache_maxsize, ttl=config.asn_cache_ttl, name="asn")
+GENERAL_CACHE = AsyncTTLCache(maxsize=config.general_cache_maxsize, ttl=config.general_cache_ttl, name="general")
 
 # -----------------------
 # Redis-backed cache adapter (optional)
@@ -333,85 +256,76 @@ REDIS_CLIENT: Optional[RedisLike] = None
 def set_redis_client(redis_client: RedisLike) -> None:
     global REDIS_CLIENT
     REDIS_CLIENT = redis_client
+    if redis_client:
+        UnifiedCache.initialize(redis_client)
+    else:
+        # Clear UnifiedCache redis client if None passed
+        UnifiedCache._redis = None
 
 
 async def async_cache_get(key: str) -> Any:
-    if REDIS_CLIENT is not None:
-        try:
-            raw = await REDIS_CLIENT.get(key)
-            if raw is not None:
-                s = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-                try:
-                    val = json.loads(s)
-                except Exception:
-                    val = s
-                MET_CACHE_HITS.inc()
-                return val
-            # miss en Redis: no retornar; dejar que el fallback por prefijo actúe
-            MET_CACHE_MISSES.inc()
-        except Exception as e:
-            logger.debug(f"Redis GET failed for {key}: {str(e)}")
-    # fallback por prefijo
-    if key.startswith(CACHE_MX):
-        return MX_CACHE.get(key)
-    if key.startswith(CACHE_IP):
-        return MX_IP_CACHE.get(key)
-    if key.startswith(CACHE_ASN):
-        return ASN_CACHE.get(key)
-    return GENERAL_CACHE.get(key)
+    """
+    Layered cache get: Redis (via UnifiedCache) -> In-Memory Fallback.
+    """
+    # Try Redis first via UnifiedCache
+    cached = await UnifiedCache.get(key)
+    if cached is not None:
+        return cached
+
+    # Fallback en memoria por prefijo (async)
+    if key.startswith("mx:"):
+        return await MX_CACHE.get(key)
+    if key.startswith("ip:") or key.startswith("mx_ip:"):
+        return await MX_IP_CACHE.get(key)
+    if key.startswith("asn:"):
+        return await ASN_CACHE.get(key)
+    return await GENERAL_CACHE.get(key)
 
 
 async def async_cache_set(key: str, value: Any, ttl: Optional[int] = None) -> None:
-    if REDIS_CLIENT is not None:
-        try:
-            payload = json.dumps(value, default=str)
-            ex = ttl if ttl is not None else config.general_cache_ttl
-            await REDIS_CLIENT.set(key, payload, ex=int(ex))
-            return
-        except Exception as e:
-            logger.debug(f"Redis SET failed for {key}: {str(e)}")
-    if key.startswith(CACHE_MX):
-        MX_CACHE.set(key, value, ttl=ttl or config.mx_cache_ttl)
-    elif key.startswith(CACHE_IP):
-        MX_IP_CACHE.set(key, value, ttl=ttl or config.ip_cache_ttl)
-    elif key.startswith(CACHE_ASN):
-        ASN_CACHE.set(key, value, ttl=ttl or config.asn_cache_ttl)
-    else:
-        GENERAL_CACHE.set(key, value, ttl=ttl or config.general_cache_ttl)
+    """
+    Layered cache set: Redis (via UnifiedCache) + In-Memory.
+    """
+    # Set in Redis via UnifiedCache
+    await UnifiedCache.set(key, value, ttl=ttl)
 
-async def _redis_delete_scan(pattern: str, batch: int = 1000) -> None:
-    assert REDIS_CLIENT is not None
-    pending: List[bytes] = []
-    async for key in REDIS_CLIENT.scan_iter(match=pattern, count=batch):
-        pending.append(key)
-        if len(pending) >= batch:
-            await REDIS_CLIENT.delete(*pending)
-            pending.clear()
-    if pending:
-        await REDIS_CLIENT.delete(*pending)
+    # Also set in memory
+    storable = value
+    if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+        storable = value.to_dict()
+
+    if key.startswith("mx:"):
+        await MX_CACHE.set(key, storable, ttl=ttl)
+    elif key.startswith("ip:") or key.startswith("mx_ip:"):
+        await MX_IP_CACHE.set(key, storable, ttl=ttl)
+    elif key.startswith("asn:"):
+        await ASN_CACHE.set(key, storable, ttl=ttl)
+    else:
+        await GENERAL_CACHE.set(key, storable, ttl=ttl)
+
 
 async def async_cache_clear(prefix: Optional[str] = None) -> None:
     """
-    Clear caches: if Redis is used, clear keys by SCAN to avoid KEYS; if no Redis, clear in-memory caches.
+    Clear cache: Redis (via UnifiedCache) + In-Memory.
     """
-    if REDIS_CLIENT is not None:
-        try:
-            pattern = f"{prefix}*" if prefix else "*"
-            await _redis_delete_scan(pattern)
-            return
-        except Exception as e:
-            logger.debug("Redis clear failed for prefix %s: %s", prefix, str(e))
-    # fallback
-    if not prefix:
-        MX_CACHE.clear()
-        MX_IP_CACHE.clear()
-        ASN_CACHE.clear()
-        GENERAL_CACHE.clear()
+    if prefix:
+        # Clear Redis via UnifiedCache
+        await UnifiedCache.clear(prefix)
+        
+        # Clear memory (async)
+        if prefix.startswith("mx:"):
+            await MX_CACHE.clear()
+        elif prefix.startswith("ip:") or prefix.startswith("mx_ip:"):
+            await MX_IP_CACHE.clear()
+        elif prefix.startswith("asn:"):
+            await ASN_CACHE.clear()
     else:
-        if prefix.startswith(CACHE_MX):
-            MX_CACHE.clear()
-        if prefix.startswith(CACHE_IP):
-            MX_IP_CACHE.clear()
+        # Clear all (async)
+        await UnifiedCache.clear()
+        await MX_CACHE.clear()
+        await MX_IP_CACHE.clear()
+        await ASN_CACHE.clear()
+        await GENERAL_CACHE.clear()
 
 # -----------------------
 # Circuit Breaker WHOIS
@@ -541,6 +455,57 @@ def normalize_domain(domain: str) -> str:
         d_ascii = d
     return d_ascii.lower()
 
+
+def normalize_email_full(email: str) -> str:
+    """
+    Normalizes email address for deduplication and comparison.
+    
+    Normalization rules:
+    - Always lowercase
+    - Gmail/Googlemail: remove dots from local part + strip +alias
+    - Other domains: strip +alias only
+    
+    Examples:
+        John.Doe+spam@gmail.com → johndoe@gmail.com
+        user+tag@example.com → user@example.com
+        no.dots@yahoo.com → no.dots@yahoo.com (keeps dots for non-Gmail)
+    
+    Args:
+        email: Email address to normalize
+        
+    Returns:
+        Normalized email address
+    """
+    if not email or "@" not in email:
+        return email.lower().strip()
+    
+    try:
+        local, domain = email.rsplit("@", 1)
+        
+        # Normalize domain (already implemented)
+        domain_normalized = normalize_domain(domain)
+        
+        # Lowercase local part
+        local = local.lower().strip()
+        
+        # Gmail/Googlemail special handling
+        if domain_normalized in ('gmail.com', 'googlemail.com'):
+            # Remove all dots from local part
+            local = local.replace('.', '')
+            # Remove everything after + (alias)
+            if '+' in local:
+                local = local.split('+')[0]
+        else:
+            # For other domains, only remove alias (keep dots)
+            if '+' in local:
+                local = local.split('+')[0]
+        
+        return f"{local}@{domain_normalized}"
+    
+    except Exception as e:
+        logger.debug(f"Email normalization failed for {email}: {e}")
+        return email.lower().strip()
+
 def safe_base64_decode(key_str: str) -> Optional[bytes]:
     try:
         s = key_str.strip()
@@ -634,7 +599,7 @@ async def resolve_mx_to_ip(mx_host: str) -> Optional[str]:
     
     mx_host = mx_host.strip().rstrip('.').lower()
     
-    cache_key = f"{CACHE_IP}{mx_host}"
+    cache_key = UnifiedCache.build_key("mx_ip", mx_host)
     cached = await async_cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -724,7 +689,7 @@ async def whois_operation(ip: str):
 async def get_asn_info(ip: str) -> Optional[ASNInfo]:
     if not ip:
         return None
-    cache_key = f"{CACHE_ASN}{ip}"
+    cache_key = UnifiedCache.build_key("asn", ip)
     cached = await async_cache_get(cache_key)
     if isinstance(cached, dict):
         return ASNInfo.from_dict(cached)
@@ -787,8 +752,26 @@ async def check_spf(domain: str) -> str:
 
 
 async def check_dkim(domain: str) -> DKIMInfo:
-    """DKIM con búsqueda multi-selector mejorada."""
-    return await enhanced_dkim_check(domain)
+    """DKIM con búsqueda multi-selector mejorada y caché."""
+    if not domain:
+        return DKIMInfo(status="not_found", record=None, selector=None, key_type=None, key_length=None)
+        
+    cache_key = UnifiedCache.build_key("dkim", domain)
+    cached = await async_cache_get(cache_key)
+    
+    if cached:
+        if isinstance(cached, dict):
+            return DKIMInfo(**cached)
+        # Si es string u otro tipo, ignorar por seguridad
+        
+    result = await enhanced_dkim_check(domain)
+    
+    # Cachear solo si se encontró algo válido o si se quiere cachear también los fallos (opcional)
+    # Aquí cacheamos todo para evitar re-lookup inmediato
+    if result.status == "valid":
+        await async_cache_set(cache_key, asdict(result), ttl=config.mx_cache_ttl)
+        
+    return result
 
 
 async def check_dmarc(domain: str) -> str:
@@ -831,7 +814,7 @@ class ProviderClassifier:
         self.asn_number_map: Dict[int, str] = {
             15169: "gmail",
             8075: "outlook",
-            16509: "amazon",
+            16509: "aws_ses",
         }
         self.provider_patterns: Dict[str, Dict[str, List[str]]] = {
             "gmail": {
@@ -839,6 +822,7 @@ class ProviderClassifier:
                     r"(^|\.)gmail-smtp-in\.l\.google\.com$",
                     r"(^|\.)aspmx\.l\.google\.com$",
                     r"(^|\.)google\.com$",
+                    r"(^|\.)googlemail\.com$",
                 ],
                 "asn_patterns": ["google"],
             },
@@ -863,7 +847,7 @@ class ProviderClassifier:
                 "mx_patterns": [r"protonmail\.ch", r"protonmail\.com"],
                 "asn_patterns": ["proton"],
             },
-            "amazon": {
+            "aws_ses": {
                 "mx_patterns": [r"amazonses\.com", r"amazon\.com"],
                 "asn_patterns": ["amazon"],
             },
@@ -1602,67 +1586,48 @@ class HaveIBeenPwnedChecker:
         redis: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Consulta si un email está en algún breach conocido."""
-        import requests
+        import httpx
         
         email_lower = email.lower().strip()
-        logger.info(f"[HIBP] ✅ Starting HIBP check for {email_lower}")  # ← NUEVO
+        logger.info(f"[HIBP] ✅ Starting HIBP check for {email_lower}")
         
         # ✅ Intentar obtener de Redis
         if redis:
-            cache_key = f"hibp:{email_lower}"
+            cache_key = UnifiedCache.build_key("hibp", email_lower)
             try:
                 cached = await asyncio.wait_for(
                     redis.get(cache_key),
                     timeout=2
                 )
                 if cached:
-                    logger.info(f"[HIBP] Cache HIT for {email_lower}")  # ← NUEVO
+                    logger.info(f"[HIBP] Cache HIT for {email_lower}")
                     data = json.loads(cached)
                     data["cached"] = True
                     return data
             except Exception as e:
-                logger.warning(f"[HIBP] Cache error: {e}")  # ← NUEVO
+                logger.warning(f"[HIBP] Cache error: {e}")
         
         try:
-            logger.info(f"[HIBP] Making HTTP request to HIBP API...")  # ← NUEVO
+            logger.info(f"[HIBP] Making async HTTP request to HIBP API...")
             
-            def _check_hibp():
-                """Hacer request en thread bloqueante."""
-                headers = {
-                    "User-Agent": "EmailValidationAPI/1.0 (+https://yourapi.com)"
-                }
-                url = "https://haveibeenpwned.com/api/v3/breachedaccount"
-                
-                logger.info(f"[HIBP] Request params: {email_lower}")  # ← NUEVO
-                
-                try:
-                    resp = requests.get(
-                        url,
-                        params={"account": email_lower, "truncateResponse": False},
-                        headers=headers,
-                        timeout=10
-                    )
-                    logger.info(f"[HIBP] Response status: {resp.status_code}")  # ← NUEVO
-                    return resp
-                except Exception as e:
-                    logger.error(f"[HIBP] Request exception: {e}")  # ← NUEVO
-                    return None
+            # ✅ Pure async httpx client (no thread blocking)
+            headers = {
+                "User-Agent": "EmailValidationAPI/1.0 (+https://yourapi.com)"
+            }
+            url = "https://haveibeenpwned.com/api/v3/breachedaccount"
             
-            response = await asyncio.to_thread(_check_hibp)
+            # Use async httpx client with timeout
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    url,
+                    params={"account": email_lower, "truncateResponse": False},
+                    headers=headers
+                )
             
-            if response is None:
-                logger.warning(f"[HIBP] Response is None")  # ← NUEVO
-                return {
-                    "in_breach": None,
-                    "breach_count": None,
-                    "breaches": [],
-                    "cached": False,
-                    "checked_at": datetime.utcnow().isoformat() + "Z",
-                    "error": "HIBP request failed"
-                }
+            logger.info(f"[HIBP] Response status: {response.status_code}")
             
             if response.status_code == 200:
-                logger.info(f"[HIBP] Email IN BREACH")  # ← NUEVO
+                logger.info(f"[HIBP] Email IN BREACH")
                 breaches_raw = response.json()
                 breaches = [
                     {
@@ -2197,6 +2162,148 @@ class SpamTrapDetector:
                 for k in expired:
                     del cls._cache[k]
 
+
+# ====================================================================================
+# UNIFIED RISK SCORING SYSTEM
+# ====================================================================================
+
+from typing import Literal
+from dataclasses import dataclass
+
+RiskLevel = Literal['low', 'medium', 'high', 'critical']
+
+@dataclass
+class RiskAssessment:
+    """Unified risk assessment result."""
+    score: int  # 0-100
+    level: RiskLevel
+    factors: Dict[str, int]
+    explanation: str
+    confidence: float  # 0.0-1.0
+
+
+class RiskScorer:
+    """
+    Unified risk scoring system for email validation.
+    
+    Aggregates multiple validation factors into single 0-100 risk score.
+    Higher score = higher risk.
+    
+    Risk Levels:
+    - 0-24: low (safe to send)
+    - 25-49: medium (caution)
+    - 50-74: high (avoid unless confident)
+    - 75-100: critical (do not send)
+    """
+    
+    WEIGHT_SPAM_TRAP = 40
+    WEIGHT_DISPOSABLE = 35
+    WEIGHT_SMTP_FAILED = 30
+    WEIGHT_BREACH = 25
+    WEIGHT_INVALID_SYNTAX = 20
+    WEIGHT_ROLE_BASED = 15
+    WEIGHT_CATCH_ALL = 12
+    WEIGHT_TOXIC_DOMAIN = 30
+    
+    @classmethod
+    def calculate_risk(
+        cls,
+        validation_result: Dict[str, Any],
+        spam_trap_result: Optional[Dict[str, Any]] = None,
+        breach_result: Optional[Dict[str, Any]] = None,
+    ) -> RiskAssessment:
+        """Calculate unified risk score from validation results."""
+        score = 0
+        factors: Dict[str, int] = {}
+        confidence_values: List[float] = []
+        
+        # 1. Spam trap (highest priority)
+        if spam_trap_result and spam_trap_result.get('is_spam_trap'):
+            trap_confidence = spam_trap_result.get('confidence', 1.0)
+            points = int(cls.WEIGHT_SPAM_TRAP * trap_confidence)
+            factors['spam_trap'] = points
+            score += points
+            confidence_values.append(trap_confidence)
+        
+        # 2. Invalid syntax
+        if not validation_result.get('syntax_valid', True):
+            factors['invalid_syntax'] = cls.WEIGHT_INVALID_SYNTAX
+            score += cls.WEIGHT_INVALID_SYNTAX
+            confidence_values.append(1.0)
+        
+        # 3. SMTP check failed
+        if not validation_result.get('smtp_checked', True):
+            factors['smtp_failed'] = cls.WEIGHT_SMTP_FAILED
+            score += cls.WEIGHT_SMTP_FAILED
+            confidence_values.append(0.85)
+        
+        # 4. Disposable email
+        if validation_result.get('disposable', False):
+            factors['disposable'] = cls.WEIGHT_DISPOSABLE
+            score += cls.WEIGHT_DISPOSABLE
+            confidence_values.append(0.95)
+        
+        # 5. Data breach
+        if breach_result:
+            is_breached = (
+                breach_result.get('breached', False) or 
+                breach_result.get('is_breached', False) or
+                (breach_result.get('breach_count', 0) > 0)
+            )
+            if is_breached:
+                factors['data_breach'] = cls.WEIGHT_BREACH
+                score += cls.WEIGHT_BREACH
+                confidence_values.append(1.0)
+        
+        # 6. Role-based email
+        if validation_result.get('role_based', False):
+            factors['role_based'] = cls.WEIGHT_ROLE_BASED
+            score += cls.WEIGHT_ROLE_BASED
+            confidence_values.append(0.9)
+        
+        # 7. Catch-all domain
+        if validation_result.get('catch_all', False):
+            factors['catch_all'] = cls.WEIGHT_CATCH_ALL
+            score += cls.WEIGHT_CATCH_ALL
+            confidence_values.append(0.7)
+        
+        # 8. Toxic/abuse domain
+        if validation_result.get('toxic_domain', False):
+            factors['toxic_domain'] = cls.WEIGHT_TOXIC_DOMAIN
+            score += cls.WEIGHT_TOXIC_DOMAIN
+            confidence_values.append(0.85)
+        
+        # Cap at 100
+        score = min(100, score)
+        
+        # Overall confidence
+        overall_confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.5
+        
+        # Determine level
+        if score >= 75:
+            level: RiskLevel = 'critical'
+            explanation = "Critical risk. Do not send. High probability of bounce or spam complaint."
+        elif score >= 50:
+            level = 'high'
+            explanation = "High risk. Avoid unless verified. Significant delivery issues likely."
+        elif score >= 25:
+            level = 'medium'
+            explanation = "Moderate risk. Use caution and monitor engagement metrics."
+        else:
+            level = 'low'
+            explanation = "Low risk. Safe to send with normal precautions."
+        
+        if factors:
+            factor_details = ", ".join([f"{k}(+{v})" for k, v in factors.items()])
+            explanation += f" Factors: {factor_details}."
+        
+        return RiskAssessment(
+            score=score,
+            level=level,
+            factors=factors,
+            explanation=explanation,
+            confidence=overall_confidence
+        )
 
 
 # -----------------------

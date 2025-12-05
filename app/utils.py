@@ -210,14 +210,11 @@ async def increment_usage(redis, user_id: str, amount: int = 1) -> None:
     key = f"usage:user:{safe_user}:{today}"  # ✅ MISMA CLAVE que read_usage_for_userid
     
     try:
-        current = await redis.get(key)
-        current_int = int(current) if current else 0
-        new_value = current_int + amount
-        
-        await redis.set(key, new_value)
+        # Atomic increment
+        new_value = await redis.incrby(key, amount)
         await redis.expire(key, 86400)
         
-        logger.info(f"Usage incremented for {user_id}: {current_int} -> {new_value}")
+        logger.info(f"Usage incremented for {user_id}: -> {new_value}")
         
     except Exception as e:
         logger.error(f"Error incrementing usage for {user_id}: {e}")
@@ -277,6 +274,10 @@ async def get_plan_by_key(hashed_key: str, redis: Redis) -> str:
                 if plan_value:
                     plan_str = str(plan_value).upper().strip()
                     return plan_str if plan_str in VALID_PLANS else "FREE"
+            elif isinstance(key_info, str):
+                plan_candidate = key_info.upper().strip()
+                if plan_candidate in VALID_PLANS:
+                    return plan_candidate
         except (json.JSONDecodeError, TypeError, AttributeError):
             plan_candidate = key_data_str.upper().strip()
             if plan_candidate in VALID_PLANS:
@@ -340,19 +341,24 @@ def add_security_headers_to_response(response: JSONResponse) -> None:
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": (
             "default-src 'self'; "
-            "script-src 'self' https://cdn.example.com; "
-            "style-src 'self'; "
-            "img-src 'self' data:; "
+            "script-src 'self' https://cdn.redoc.ly; "  # Allow ReDoc CDN
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " # Allow fonts
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; "
             "connect-src 'self'; "
-            "frame-ancestors 'none'"
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self';"
         ),
         "Permissions-Policy": (
-            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+            "magnetometer=(), microphone=(), payment=(), usb=(), "
+            "display-capture=(), screen-wake-lock=(), web-share=()"
         ),
         "Referrer-Policy": "strict-origin-when-cross-origin",
         "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
         "X-Frame-Options": "DENY",
-        # No X-XSS-Protection: deprecado
+        "X-Permitted-Cross-Domain-Policies": "none",
     }
     response.headers.update(headers)
 
@@ -518,3 +524,27 @@ async def repair_user_data(user_id: str, email: str, plan: str, redis: Redis) ->
     except Exception as e:
         logger.error(f"Error repairing user data: {str(e)}")
         return False
+
+
+async def adjust_quotas(user_id: str, redis: Redis):
+    usage = int(await redis.get(f"usage:{user_id}") or 0)
+    plan = await get_plan_by_key(user_id, redis)
+
+    # Acceder como atributo, no como diccionario
+    threshold_percent = settings.dynamic_quotas.threshold_percent
+
+    base_limits = {
+        "free": 1,
+        "premium": 100,
+        "enterprise": 1000,
+        "FREE": 1,
+        "PREMIUM": 100,
+        "ENTERPRISE": 1000
+    }
+    base_limit = base_limits.get(plan.lower(), 1)
+    threshold = base_limit * threshold_percent
+
+    if usage > threshold:
+        new_limit = calculate_dynamic_limit(usage, plan)
+        await redis.set(f"rate_limit:{user_id}", new_limit)
+        logger.info(f"Adjusted quota for {user_id} to {new_limit}")

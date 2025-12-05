@@ -1,1 +1,127 @@
-node_modules
+# ============================================
+# SENSITIVE DATA - NEVER COMMIT
+# ============================================
+cosas.txt
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+.hypothesis/
+
+# ============================================
+# IDEs and Editors
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# ============================================
+# Node.js (for SDKs/tooling)
+# ============================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+.pnp/
+.pnp.js
+
+# ============================================
+# Docker & Infrastructure
+# ============================================
+dump.rdb
+*.rdb
+*.aof
+
+# ============================================
+# Logs
+# ============================================
+logs/
+*.log
+pip-log.txt
+
+# ============================================
+# OS generated
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ============================================
+# Backups
+# ============================================
+*.bak
+*.backup
+*.old
+*.orig
+
+# ============================================
+# Temporary files
+# ============================================
+tmp/
+temp/
+*.tmp
