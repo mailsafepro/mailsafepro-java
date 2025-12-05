@@ -11,9 +11,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security, status
 from fastapi.responses import JSONResponse
 from fastapi.security import SecurityScopes
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, model_validator   
 
-from app.auth import get_redis, validate_api_key_or_token, TokenData  # nombres según tus exports reales
+from app.auth import get_redis, get_arq_redis, validate_api_key_or_token, TokenData  # nombres según tus exports reales
 from app.config import get_settings
 from app.logger import logger
 from app.metrics import metrics_recorder
@@ -34,14 +34,18 @@ class JobCreateRequest(BaseModel):
     sandbox: bool = False
     metadata: Optional[Dict[str, Any]] = None
 
-    @validator("emails", always=True)
-    def validate_source(cls, v, values):
-        src = values.get("source")
-        if src == "list" and (not v or len(v) == 0):
+    @model_validator(mode='after')
+    def validate_source_requirements(self):
+        # Si source es 'list', emails es obligatorio
+        if self.source == "list" and (not self.emails or len(self.emails) == 0):
             raise ValueError("emails requeridos cuando source = list")
-        if src == "upload" and not values.get("file_token"):
+
+        # Si source es 'upload', file_token es obligatorio
+        if self.source == "upload" and not self.file_token:
             raise ValueError("file_token requerido cuando source = upload")
-        return v
+
+        return self
+
 
 class JobCreateResponse(BaseModel):
     job_id: str
@@ -108,6 +112,7 @@ async def create_job(
     current: TokenData = Security(validate_api_key_or_token, scopes=["job:create"]),
     x_idempotency_key: Optional[str] = Header(default=None, alias="X-Idempotency-Key"),
     redis=Depends(get_redis),
+    arq_redis=Depends(get_arq_redis),
 ):
     # Idempotencia: si llega clave repetida en 24h, devolver el mismo job_id
     if x_idempotency_key:
@@ -166,10 +171,12 @@ async def create_job(
         "metadata": body.metadata or {},
         "created_at": meta["created_at"],
     }
-    await redis.lpush(JOBS_QUEUE_KEY, json.dumps(payload))
+    
+    # Enqueue with ARQ
+    await arq_redis.enqueue_job("validate_batch_task", job_id, payload)
+    
     try:
-        depth = await redis.llen(JOBS_QUEUE_KEY)
-        metrics_recorder.set_job_queue_depth(JOBS_QUEUE_KEY, depth)
+        metrics_recorder.record_arq_job_event("default", "validate_batch_task", "queued")
     except Exception:
         pass
     await redis.set(progress_key, json.dumps({"status": "queued", "queued_at": _now_iso()}), ex=RETENTION_SECONDS_DEFAULT)
