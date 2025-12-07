@@ -647,19 +647,16 @@ class Settings(BaseSettings):
             if len(api_key_secret) < 32:
                 raise ValueError("API_KEY_SECRET must be at least 32 characters in PRODUCTION")
             
-            # ✅ VirusTotal API key - debe ser real, no default
-            vt_key = self.vt_api_key.get_secret_value()
-            if vt_key in WEAK_DEFAULTS:
+            vtkey = self.vt_api_key.get_secret_value()
+            if vtkey and vtkey in WEAK_DEFAULTS:  # ← Agregar "if vtkey and"
                 raise ValueError("VT_API_KEY cannot use default test value in PRODUCTION")
-            
-            # ✅ Clearbit API key - debe ser real, no default
-            clearbit_key = self.clearbit_api_key.get_secret_value()
-            if clearbit_key in WEAK_DEFAULTS:
+
+            clearbitkey = self.clearbit_api_key.get_secret_value()
+            if clearbitkey and clearbitkey in WEAK_DEFAULTS:  # ← Agregar "if clearbitkey and"
                 raise ValueError("CLEARBIT_API_KEY cannot use default test value in PRODUCTION")
-            
-            # ✅ Metrics API key - debe ser real, no default
-            metrics_key = self.metrics_api_key.get_secret_value()
-            if metrics_key in WEAK_DEFAULTS:
+
+            metricskey = self.metrics_api_key.get_secret_value()
+            if metricskey and metricskey in WEAK_DEFAULTS:  # ← Agregar "if metricskey and"
                 raise ValueError("API_KEY_METRICS cannot use default test value in PRODUCTION")
             
             # SMTP credentials if not localhost
