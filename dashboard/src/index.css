@@ -9,43 +9,69 @@
 
   body {
     @apply bg-gradient-to-br from-slate-50 to-slate-100 text-slate-900;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
+  /* Focus states mejorados */
   input:focus,
   textarea:focus,
   select:focus {
-    @apply outline-none ring-2 ring-primary-500 ring-offset-2;
+    @apply outline-none ring-2 ring-indigo-500 ring-offset-2;
+  }
+
+  /* Scrollbar personalizado (opcional) */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-gray-100;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-400 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-500;
   }
 }
 
 @layer components {
+  /* Botones - Ya no necesarios porque usamos el componente Button */
+  /* Pero los dejamos por compatibilidad con código legacy */
   .btn-primary {
-    @apply px-4 py-2 bg-gradient-to-r from-primary-500 to-primary-600 text-white font-medium rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100;
+    @apply px-4 py-2 bg-gradient-to-r from-indigo-500 to-indigo-600 text-white font-medium rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100;
   }
 
   .btn-secondary {
-    @apply px-4 py-2 bg-white border-2 border-primary-200 text-primary-600 font-medium rounded-lg hover:bg-primary-50 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply px-4 py-2 bg-white border-2 border-indigo-200 text-indigo-600 font-medium rounded-lg hover:bg-indigo-50 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
   }
 
   .btn-outline {
-    @apply px-4 py-2 border-2 border-slate-300 text-slate-700 font-medium rounded-lg hover:bg-slate-50 transition-colors duration-200;
+    @apply px-4 py-2 border-2 border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors duration-200;
   }
 
+  /* Cards - Pueden seguir usándose */
   .card {
-    @apply bg-white rounded-xl shadow-soft hover:shadow-medium transition-shadow duration-300 border border-slate-100;
+    @apply bg-white rounded-xl shadow-sm hover:shadow-md transition-shadow duration-300 border border-gray-100;
   }
 
   .card-glass {
-    @apply bg-white/80 backdrop-blur-glass rounded-xl shadow-glass border border-white/20;
+    @apply bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20;
   }
 
+  /* Input field - Legacy, ahora usamos componente Input */
   .input-field {
-    @apply w-full px-4 py-2.5 border-2 border-slate-200 rounded-lg bg-white text-slate-900 placeholder-slate-400 transition-all duration-200 hover:border-slate-300 focus:border-primary-500;
+    @apply w-full px-4 py-2.5 border-2 border-gray-200 rounded-lg bg-white text-gray-900 placeholder-gray-400 transition-all duration-200 hover:border-gray-300 focus:border-indigo-500;
   }
 
+  /* Badges - Legacy */
   .badge-primary {
-    @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-primary-100 text-primary-700;
+    @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-indigo-100 text-indigo-700;
   }
 
   .badge-danger {
@@ -56,7 +82,19 @@
     @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-700;
   }
 
+  /* Gradient text */
   .gradient-text {
-    @apply bg-gradient-to-r from-primary-600 to-accent-600 bg-clip-text text-transparent;
+    @apply bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent;
+  }
+}
+
+/* Animaciones personalizadas */
+@layer utilities {
+  .animation-delay-200 {
+    animation-delay: 200ms;
+  }
+
+  .animation-delay-400 {
+    animation-delay: 400ms;
   }
 }

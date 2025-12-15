@@ -29,7 +29,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 from fastapi.security import SecurityScopes
-
+from dataclasses import dataclass
 from app.auth import get_redis, validate_api_key_or_token
 from app.cache import AsyncTTLCache
 from app.config import get_settings
@@ -62,14 +62,113 @@ from app.utils import increment_usage, _get_plan_config_safe
 from app.validation import (
     SMTP_RESTRICTED_DOMAINS,
     VerificationResult,
+    is_special_use_tld,
     cached_check_domain,
     check_smtp_mailbox_safe,
-    is_disposable_domain,
+    domain_validator,
     detect_catch_all_domain,  # ← NUEVO: Catch-all detection
     is_abuse_domain,  # ← NUEVO: Abuse domain detection
+    _idna_ascii,  # ← NUEVO: IDNA ASCII
 )
 
 router = APIRouter(tags=["Email Validation"])
+
+
+@dataclass
+class SimpleRiskAssessment:
+    score: int                 # 0..100
+    level: str                 # low|medium|high
+    factors: Dict[str, int]    # pesos por factor
+    explanation: str
+    confidence: float          # 0..1
+
+
+def compute_risk_assessment(
+    *,
+    valid: bool,
+    reputation: float,
+    smtp_status: str,
+    mailbox_exists: Optional[bool],
+    is_restricted: bool,
+    spam_trap_info: Optional[Dict[str, Any]],
+    breach_info: Optional[Dict[str, Any]],
+    role_email_info: Optional[Dict[str, Any]],
+    catch_all_info: Optional[Dict[str, Any]],
+    toxic_domain: bool,
+) -> SimpleRiskAssessment:
+    if not valid:
+        return SimpleRiskAssessment(
+            score=100,
+            level="high",
+            factors={"invalid": 100},
+            explanation="Invalid email; treat as high risk.",
+            confidence=0.95,
+        )
+
+    factors: Dict[str, int] = {}
+    score = 0
+
+    rep = max(0.0, min(1.0, float(reputation or 0.5)))
+    base = int(round((1.0 - rep) * 40))  # 0..40
+    if base:
+        factors["provider_reputation"] = base
+        score += base
+
+    # Spam trap: hard block si confianza alta
+    if spam_trap_info and spam_trap_info.get("is_spam_trap") and (spam_trap_info.get("confidence") or 0.0) >= 0.9:
+        conf = float(spam_trap_info.get("confidence") or 0.9)
+        return SimpleRiskAssessment(
+            score=100,
+            level="high",
+            factors={"spam_trap": 100},
+            explanation="High-confidence spam trap signal.",
+            confidence=conf,
+        )
+    elif spam_trap_info and spam_trap_info.get("is_spam_trap"):
+        conf = float(spam_trap_info.get("confidence") or 0.3)
+        w = int(round(max(0.0, min(1.0, conf)) * 30))
+        if w:
+            factors["spam_trap_suspected"] = w
+            score += w
+
+    if breach_info and breach_info.get("in_breach"):
+        factors["breach"] = 15
+        score += 15
+
+    if role_email_info and role_email_info.get("is_role_email"):
+        factors["role_email"] = 5
+        score += 5
+
+    if catch_all_info and catch_all_info.get("is_catchall"):
+        factors["catch_all"] = 10
+        score += 10
+
+    if toxic_domain:
+        factors["abuse_domain"] = 20
+        score += 20
+
+    # SMTP: NO confundir “saltado por plan” con “fallo”
+    if smtp_status == "skipped_restricted" or is_restricted:
+        factors["smtp_restricted"] = 5
+        score += 5
+    elif smtp_status == "skipped_plan":
+        factors["smtp_not_available"] = 10
+        score += 10
+    elif smtp_status in ("timeout", "error"):
+        factors["smtp_failed"] = 30
+        score += 30
+    elif smtp_status == "attempted":
+        if mailbox_exists is False:
+            factors["mailbox_not_found"] = 60
+            score += 60
+        elif mailbox_exists is None:
+            factors["smtp_inconclusive"] = 25
+            score += 25
+
+    score = max(0, min(100, score))
+    level = "low" if score < 20 else "medium" if score < 50 else "high"
+    explanation = f"{level.capitalize()} risk. Factors: " + ", ".join([f"{k}(+{v})" for k, v in factors.items()]) + "."
+    return SimpleRiskAssessment(score=score, level=level, factors=factors, explanation=explanation, confidence=0.85)
 
 
 # ---------------------------
@@ -190,6 +289,7 @@ class ResponseBuilder:
         mx_server: Optional[str] = None,
         mailbox_exists: Optional[bool] = None,
         skip_reason: Optional[str] = None,
+        is_restricted: bool = False,
         error_type: Optional[str] = None,
         provider: Optional[str] = None,
         fingerprint: Optional[str] = None,
@@ -215,6 +315,7 @@ class ResponseBuilder:
         spam_trap_info: Optional[Dict[str, Any]] = None,  # ← NUEVO
         cache_used: bool = False,
         client_plan: Optional[str] = None,
+        testing_mode: bool = False
     ) -> JSONResponse:
         """
         Construye respuesta JSON validada con todos los campos.
@@ -286,7 +387,7 @@ class ResponseBuilder:
         # - "deliverable": email válido con alta confianza (valid=True y suggested_action="accept")
         # - "risky": email válido pero con señales de riesgo (valid=True y suggested_action in ["review", "monitor"])
         # - "unknown": no se pudo verificar completamente (valid=True pero mailbox_exists=None)
-        
+
         if not valid:
             # Email definitivamente inválido
             email_status = "undeliverable"
@@ -299,31 +400,59 @@ class ResponseBuilder:
                 dmarc_status and dmarc_status in ["valid", "enforced"]
             ])
             
-            # Clasificación mejorada
-            if risk_score >= 0.7:
-                # Alto riesgo
-                email_status = "risky"
-            elif risk_score >= 0.4 and not provider_is_known:
-                # Riesgo medio + proveedor desconocido = risky (no unknown)
-                email_status = "risky"
-            elif suggested_action == "accept" and (provider_is_known or has_dns_security):
-                # Baja confianza pero con señales positivas
-                email_status = "deliverable"
-            elif mailbox_exists is False:
-                # Buzón no existe (verificado por SMTP)
+            # 🆕 NUEVO: Verificar si es role email
+            is_role_email = False
+            if role_email_info and isinstance(role_email_info, dict):
+                is_role_email = role_email_info.get("is_role_email", False)
+            
+            # 🔹 PRIORIDAD 1: Casos con error_type específico
+            if error_type == "unsafe_mx_host":
+                # MX inseguro = definitivamente no entregable
                 email_status = "undeliverable"
-            elif mailbox_exists is None and not has_dns_security:
-                # No se pudo verificar y sin señales de seguridad
-                email_status = "unknown"
-            elif suggested_action in ["review", "monitor"]:
-                # Requiere revisión
+            
+            elif error_type == "no_mx_has_a":
+                # Sin MX pero con A = riesgoso
                 email_status = "risky"
+            
+            # 🔹 PRIORIDAD 2: Role emails siempre son al menos "risky"
+            elif is_role_email:
+                # Role emails son riesgosos independientemente del risk_score
+                email_status = "risky"
+                logger.debug(f"Status forced to 'risky' due to role email detection")
+            
+            # 🔹 PRIORIDAD 3: Alto riesgo
+            elif risk_score >= 0.7:
+                email_status = "risky"
+            
+            # 🔹 PRIORIDAD 4: Riesgo medio + proveedor desconocido
+            elif risk_score >= 0.4 and not provider_is_known:
+                email_status = "risky"
+            
+            # 🔹 PRIORIDAD 5: Baja confianza pero con señales positivas
+            elif suggested_action == "accept" and (provider_is_known or has_dns_security):
+                email_status = "deliverable"
+            
+            # 🔹 PRIORIDAD 6: Mailbox no existe (SMTP verificado)
+            elif mailbox_exists is False:
+                email_status = "undeliverable"
+            
+            # 🔹 PRIORIDAD 7: No se pudo verificar y sin señales de seguridad
+            elif mailbox_exists is None and not has_dns_security:
+                email_status = "unknown"
+            
+            # 🔹 PRIORIDAD 8: Requiere revisión
+            elif suggested_action in ["review", "monitor"]:
+                email_status = "risky"
+            
+            # 🔹 PRIORIDAD 9: Caso por defecto para válidos
             else:
-                # Caso por defecto para válidos
                 email_status = "deliverable"
 
 
         # ESTRUCTURA CON VALORES SEGUROS
+        # Initialize smtp_result as empty dict if not provided
+        smtp_result = {}
+        
         content: Dict[str, Any] = {
             "email": email,
             "valid": bool(valid),
@@ -333,6 +462,9 @@ class ResponseBuilder:
             "quality_score": round(float(quality_score), 3),
             "validation_tier": ResponseBuilder._get_validation_tier(smtp_checked, include_raw_dns),
             "suggested_action": suggested_action,
+            "is_restricted": is_restricted,  # Usar el parámetro is_restricted
+            "smtp_checked": smtp_checked,
+            "mailbox_exists": mailbox_exists,
             "status": email_status,
             "provider_analysis": {
                 "provider": provider or "unknown",
@@ -345,6 +477,7 @@ class ResponseBuilder:
                 "skip_reason": skip_reason,
                 "mx_server": mx_server,
                 "detail": smtp_detail,
+                "is_restricted": is_restricted  # Usar el mismo valor que a nivel superior
             },
             "dns_security": {
                 "spf": {
@@ -549,9 +682,10 @@ class EmailValidationEngine:
         try:
             auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
-                from jose import jwt as jose_jwt
+                import jwt
                 token = auth_header.split(" ")[1]
-                payload = jose_jwt.get_unverified_claims(token)
+                # Using options={"verify_signature": False} to match get_unverified_claims behavior
+                payload = jwt.decode(token, options={"verify_signature": False})
                 plan = payload.get("plan")
                 if plan:
                     return plan.upper()
@@ -568,13 +702,46 @@ class EmailValidationEngine:
         redis,
         user_id: str,
         plan: str,
+        testing_mode: bool = False
     ) -> JSONResponse:
-        """Orquesta la validación completa con timeout y fallback robusto."""
+        """
+        Orquesta la validación completa con timeout y fallback robusto.
+        
+        🔹 CONTRATO HTTP (Best Practices):
+        
+        - 422 Unprocessable Entity:
+        • Formato de email inválido (sintaxis)
+        • Dominio malformado (formato)
+        • Violación de políticas de entorno (special-use TLDs en producción)
+        • Input no procesable por razones de formato
+        
+        - 200 OK:
+        • Request válido y motor ejecutado correctamente
+        • Resultado expresado en:
+            - valid: true/false (formato + dominio procesable)
+            - status: deliverable/risky/undeliverable/unknown (decisión cliente)
+            - errortype: presente si valid=false o status != deliverable
+        
+        Ejemplos de 200 con valid=False:
+            • Disposable email
+            • Typo detectado
+            • Spam trap
+            • No DNS records
+        
+        Ejemplos de 200 con valid=True pero status != deliverable:
+            • No MX pero A existe → valid=true, status=risky, errortype=no_mx_has_a
+            • Unsafe MX host → valid=true, status=undeliverable, errortype=unsafe_mx_host
+            • SMTP mailbox not found → valid=true, status=undeliverable
+        
+        - 5xx:
+        • Errores de infraestructura (Redis down, timeout general, etc.)
+        """
         start_time = time.time()
         validation_id = str(uuid.uuid4())
         
-        client_plan = self._extract_plan_from_request(request)
-        resolved_plan = (plan or "").upper() or client_plan
+        client_plan = (self._extract_plan_from_request(request) or "").upper()
+        plan_upper = (plan or "").upper()
+        resolved_plan = plan_upper or client_plan or "UNKNOWN"
         
         spam_trap_check = None
         suggested_fixes = None
@@ -582,27 +749,94 @@ class EmailValidationEngine:
         
         try:
             # ============================================================
-            # PASO 1A: Validar formato y normalizar COMPLETO
+            # PASO 1A: Validar formato básico del email
             # ============================================================
-            # 1. Validate format
-            formatted_email = await self._validate_email_format(email)
-            logger.info(f"{validation_id} | Format validation passed | Email: {mask_email(formatted_email)}")            
-            # 2. Apply full normalization (alias removal, Gmail dots, etc.)
-            normalized_email = normalize_email_full(formatted_email)
-            
-            # Log if normalization changed the email
-            if normalized_email != formatted_email:
-                logger.info(
-                    f"{validation_id} | Email normalized | "
-                    f"Original: {formatted_email} → Normalized: {normalized_email}"
+            try:
+                from email_validator import validate_email as validate_email_lib, EmailNotValidError
+                email_normalized = await self._validate_email_format(email)
+            except EmailNotValidError as e:
+                # ✅ 422: Formato de email inválido (no procesable)
+                return await ResponseBuilder.build_validation_response(
+                    email=email,
+                    start_time=start_time,
+                    valid=False,
+                    validation_id=validation_id,
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    error_type="invalid_format",
+                    detail=str(e),
+                    client_plan=resolved_plan,
+                    suggested_fixes=None,
+                    spam_trap_info=None,
                 )
             
             # ============================================================
-            # PASO 1B: Verificar typos
+            # PASO 1B: Validar formato de dominio Y políticas de entorno
+            # (special-use TLDs, dominio malformado)
+            # ============================================================
+            # Extraer dominio
+            domain = email_normalized.split("@")[-1] if "@" in email_normalized else ""
+            
+            # Validación básica de formato de dominio
+            if not domain or not domain_validator.is_valid_domain_format(domain):
+                # ✅ 422: Dominio malformado
+                return await ResponseBuilder.build_validation_response(
+                    email=email_normalized,
+                    start_time=start_time,
+                    valid=False,
+                    validation_id=validation_id,
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    error_type="invalid_domain",
+                    detail="Invalid domain format",
+                    client_plan=resolved_plan,
+                    suggested_fixes=None,
+                    spam_trap_info=None,
+                )
+            
+            # Política de entorno: special-use TLDs solo en testing_mode
+            if not testing_mode and is_special_use_tld(domain):
+                # ✅ 422: Violación de política de entorno
+                return await ResponseBuilder.build_validation_response(
+                    email=email_normalized,
+                    start_time=start_time,
+                    valid=False,
+                    validation_id=validation_id,
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    error_type="invalid_domain",
+                    detail="Special-use TLDs (.test, .invalid, .localhost) not allowed in production",
+                    client_plan=resolved_plan,
+                    suggested_fixes=None,
+                    spam_trap_info=None,
+                )
+            
+            # ============================================================
+            # PASO 2A: Verificar DISPOSABLE (antes de checks costosos)
+            # ============================================================
+            from app.providers import is_disposable_email
+            
+            if is_disposable_email(email_normalized):
+                logger.warning(f"Disposable email detected: {email_normalized}")
+                # ✅ 200: Email procesable pero es disposable
+                return await ResponseBuilder.build_validation_response(
+                    email=email_normalized,
+                    start_time=start_time,
+                    valid=False,
+                    validation_id=validation_id,
+                    detail="Disposable/temporary email address detected",
+                    status_code=status.HTTP_200_OK,
+                    error_type="disposable_email",
+                    risk_score=1.0,
+                    quality_score=0.0,
+                    client_plan=resolved_plan,
+                    suggested_fixes=None,
+                    spam_trap_info=None,
+                )
+            
+            # ============================================================
+            # PASO 2B: Verificar typos en el dominio
             # ============================================================
             from app.providers import check_typo_suggestion
             
-            typo_check = check_typo_suggestion(normalized_email)
+            typo_check = check_typo_suggestion(email_normalized)
             
             if typo_check:
                 suggested_email, confidence = typo_check
@@ -613,12 +847,13 @@ class EmailValidationEngine:
                     "reason": "Possible typo detected in domain"
                 }
                 logger.warning(
-                    f"{validation_id} | Typo detected: {normalized_email} → {suggested_email} "
+                    f"{validation_id} | Typo detected: {email_normalized} → {suggested_email} "
                     f"(confidence: {confidence*100.0:.0f}%)"
                 )
                 
+                # ✅ 200: Email procesable pero tiene typo
                 return await ResponseBuilder.build_validation_response(
-                    email=normalized_email,
+                    email=email_normalized,
                     start_time=start_time,
                     valid=False,
                     validation_id=validation_id,
@@ -629,71 +864,55 @@ class EmailValidationEngine:
                     quality_score=0.4,
                     client_plan=resolved_plan,
                     suggested_fixes=suggested_fixes,
-                    spam_trap_info=None,  # No se ejecutó aún
+                    spam_trap_info=None,
                 )
             
             # ============================================================
-            # PASO 1C: Verificar DISPOSABLE - EJECUTAR PRIMERO
+            # PASO 2C: Detección de spam traps (UNA SOLA VEZ)
             # ============================================================
-            from app.providers import is_disposable_email
-            
-            if is_disposable_email(normalized_email):
-                logger.warning(f"Disposable email detected: {normalized_email}")
-                return await ResponseBuilder.build_validation_response(
-                    email=normalized_email,
-                    start_time=start_time,
-                    valid=False,
-                    validation_id=validation_id,
-                    detail="Disposable/temporary email address detected",
-                    status_code=status.HTTP_200_OK,
-                    error_type="disposable_email",
-                    risk_score=1.0,
-                    quality_score=0.0,
-                    client_plan=resolved_plan,
-                    suggested_fixes=suggested_fixes,
-                    spam_trap_info=None,  # No necesitamos spam trap check si es disposable
-                )
-            
-            # ============================================================
-            # PASO 1D: SPAM TRAP CHECK - EJECUTAR DESPUÉS DE DISPOSABLE
-            # ============================================================
-            from app.providers import SpamTrapDetector
-            
-            logger.info(f"{validation_id} | Checking spam traps...")
-            spam_trap_check = await SpamTrapDetector.is_spam_trap(normalized_email)
-            
-            logger.info(
-                f"{validation_id} | Spam trap check completed | "
-                f"is_trap={spam_trap_check['is_spam_trap']}, "
-                f"confidence={spam_trap_check['confidence']}, "
-                f"type={spam_trap_check['trap_type']}"
-            )
-
-            # Si es spam trap con alta confianza, rechazar inmediatamente
-            HIGH_TRAP_THRESHOLD = 0.9  # umbral de bloqueo duro
-
-            if spam_trap_check["is_spam_trap"] and spam_trap_check["confidence"] >= HIGH_TRAP_THRESHOLD:
-                logger.warning(
-                    f"{validation_id} | SPAM TRAP DETECTED | Email: {normalized_email} | "
-                    f"Type: {spam_trap_check['trap_type']} | Confidence: {spam_trap_check['confidence']}"
+            try:
+                from app.providers import SpamTrapDetector
+                
+                logger.info(f"{validation_id} | Checking spam traps...")
+                spam_trap_check = await SpamTrapDetector.is_spam_trap(email_normalized)
+                
+                logger.info(
+                    f"{validation_id} | Spam trap check completed | "
+                    f"is_trap={spam_trap_check['is_spam_trap']}, "
+                    f"confidence={spam_trap_check['confidence']}, "
+                    f"type={spam_trap_check['trap_type']}"
                 )
                 
-                return await ResponseBuilder.build_validation_response(
-                    email=normalized_email,
-                    start_time=start_time,
-                    valid=False,
-                    validation_id=validation_id,
-                    detail=f"Spam trap detected: {spam_trap_check['details']}",
-                    status_code=status.HTTP_200_OK,
-                    error_type="spam_trap",
-                    risk_score=1.0,
-                    quality_score=0.0,
-                    client_plan=resolved_plan,
-                    spam_trap_info=spam_trap_check,
-                )
-
+                # Si es spam trap con alta confianza, rechazar inmediatamente
+                HIGH_TRAP_THRESHOLD = 0.9  # umbral de bloqueo duro
+                
+                if spam_trap_check["is_spam_trap"] and spam_trap_check["confidence"] >= HIGH_TRAP_THRESHOLD:
+                    logger.warning(
+                        f"{validation_id} | SPAM TRAP DETECTED | Email: {email_normalized} | "
+                        f"Type: {spam_trap_check['trap_type']} | Confidence: {spam_trap_check['confidence']}"
+                    )
+                    
+                    # ✅ 200: Email procesable pero es spam trap
+                    return await ResponseBuilder.build_validation_response(
+                        email=email_normalized,
+                        start_time=start_time,
+                        valid=False,
+                        validation_id=validation_id,
+                        detail=f"Spam trap detected: {spam_trap_check['details']}",
+                        status_code=status.HTTP_200_OK,
+                        error_type="spam_trap",
+                        risk_score=1.0,
+                        quality_score=0.0,
+                        client_plan=resolved_plan,
+                        spam_trap_info=spam_trap_check,
+                    )
+            
+            except Exception as e:
+                logger.warning(f"Error en detección de spam trap: {e}")
+                spam_trap_check = None
+            
             # ============================================================
-            # PASO 1E: Verificar HaveIBeenPwned (solo PREMIUM+)
+            # PASO 3: Verificar HaveIBeenPwned (solo PREMIUM+)
             # ============================================================
             plan_upper = (plan or "").upper()
             if plan_upper in ["PREMIUM", "ENTERPRISE"]:
@@ -701,7 +920,7 @@ class EmailValidationEngine:
                     from app.providers import HaveIBeenPwnedChecker
                     breach_info = await asyncio.wait_for(
                         HaveIBeenPwnedChecker.check_email_in_breach(
-                            normalized_email,
+                            email_normalized,
                             redis=redis
                         ),
                         timeout=12,
@@ -717,17 +936,16 @@ class EmailValidationEngine:
                 except Exception as e:
                     logger.error(f"[{validation_id}] HIBP error: {str(e)[:200]}")
                     breach_info = None
-
-                
+            
             # ============================================================
-            # PASO 2: Analizar proveedor CON TIMEOUT
+            # PASO 4: Analizar proveedor CON TIMEOUT
             # ============================================================
             logger.info(f"{validation_id} | Analyzing provider...")
             
             try:
                 provider_analysis = await asyncio.wait_for(
                     analyze_email_provider(
-                        normalized_email, 
+                        email_normalized, 
                         redis=redis,
                         timeout=5.0
                     ),
@@ -742,9 +960,9 @@ class EmailValidationEngine:
                 )
             
             except asyncio.TimeoutError:
-                logger.warning(f"Provider analysis TIMEOUT for {normalized_email}")
+                logger.warning(f"Provider analysis TIMEOUT for {email_normalized}")
                 provider_analysis = ProviderAnalysis(
-                    domain=normalized_email.split("@")[-1],
+                    domain=email_normalized.split("@")[-1],
                     primary_mx=None,
                     ip=None,
                     asn_info=None,
@@ -769,7 +987,7 @@ class EmailValidationEngine:
             except Exception as e:
                 logger.error(f"Provider analysis ERROR: {str(e)[:200]}", exc_info=True)
                 provider_analysis = ProviderAnalysis(
-                    domain=normalized_email.split("@")[-1],
+                    domain=email_normalized.split("@")[-1],
                     primary_mx=None,
                     ip=None,
                     asn_info=None,
@@ -792,48 +1010,128 @@ class EmailValidationEngine:
                 )
             
             # ============================================================
-            # PASO 3: Validar dominio
+            # PASO 5: Validar dominio (DNS/MX checks)
             # ============================================================
-            domain_result = await self._validate_domain(normalized_email, redis)
-            
+            domain_result = await self._validate_domain(email_normalized, redis, testing_mode)
+
+            # 🔹 LOG DE DEBUGGING: Verificar qué devuelve domain_result
+            logger.info(
+                f"[{validation_id}] Domain validation complete | "
+                f"valid={domain_result.valid} | "
+                f"error_type={domain_result.error_type} | "
+                f"mx_host={domain_result.mx_host} | "
+                f"detail={domain_result.detail}"
+            )
+
+            # 🔹 Analizar el tipo de error para decidir flujo
             if not domain_result.valid:
-                return await ResponseBuilder.build_validation_response(
-                    email=normalized_email,
-                    start_time=start_time,
-                    valid=False,
-                    validation_id=validation_id,
-                    detail=domain_result.detail or "Domain validation failed",
-                    status_code=status.HTTP_200_OK,
-                    error_type=domain_result.error_type or "domain_invalid",
-                    provider=provider_analysis.provider,
-                    reputation=provider_analysis.reputation,
-                    fingerprint=provider_analysis.fingerprint,
-                    client_plan=resolved_plan,
-                    suggested_fixes=suggested_fixes,
-                    spam_trap_info=spam_trap_check,
-                    breach_info=breach_info,
-                )
+                error_type = domain_result.error_type or "domain_invalid"
+                
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # CASOS QUE TERMINAN LA VALIDACIÓN (retornan 200)
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                if error_type in [
+                    "no_dns_records",       # Sin MX ni A records
+                    "reserved_domain",       # example.com, example.net, example.org
+                    "abuse_domain",          # Dominio de abuso conocido
+                    "disposable_domain",     # Dominio descartable
+                ]:
+                    logger.info(
+                        f"[{validation_id}] Domain validation FAILED (terminal) | "
+                        f"Error: {error_type} | Detail: {domain_result.detail}"
+                    )
+                    
+                    # ✅ 200 OK: Email procesable pero dominio no válido
+                    return await ResponseBuilder.build_validation_response(
+                        email=email_normalized,
+                        start_time=start_time,
+                        valid=False,
+                        validation_id=validation_id,
+                        detail=domain_result.detail or "Domain validation failed",
+                        status_code=status.HTTP_200_OK,
+                        error_type=error_type,
+                        provider=provider_analysis.provider,
+                        reputation=provider_analysis.reputation,
+                        fingerprint=provider_analysis.fingerprint,
+                        client_plan=resolved_plan,
+                        suggested_fixes=suggested_fixes,
+                        spam_trap_info=spam_trap_check,
+                        breach_info=breach_info,
+                    )
+                
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # CASOS QUE PERMITEN CONTINUAR (problemas de infraestructura)
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                elif error_type in [
+                    "smtp_connection_unavailable",  # Problemas de conectividad SMTP
+                    "mx_connection_failed",          # MX existe pero no conecta
+                    "no_mx_has_a",                   # MX ausente pero A record existe
+                    "unsafe_mx_host",                # MX apunta a localhost/IPs privadas
+                ]:
+                    logger.info(
+                        f"[{validation_id}] Domain has issues but CONTINUING | "
+                        f"Error: {error_type} | Detail: {domain_result.detail} | "
+                        f"Will include error_type in final response"
+                    )
+                    # ✅ NO terminar aquí - continuar con el flujo normal
+                    # El error_type se propagará a la respuesta final
+                
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # CASOS DESCONOCIDOS (terminar por seguridad)
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                else:
+                    logger.warning(
+                        f"[{validation_id}] Domain validation FAILED (unknown error) | "
+                        f"Error: {error_type} | Detail: {domain_result.detail}"
+                    )
+                    
+                    # ✅ 200 OK: Email procesable pero error desconocido
+                    return await ResponseBuilder.build_validation_response(
+                        email=email_normalized,
+                        start_time=start_time,
+                        valid=False,
+                        validation_id=validation_id,
+                        detail=domain_result.detail or "Domain validation failed",
+                        status_code=status.HTTP_200_OK,
+                        error_type=error_type,
+                        provider=provider_analysis.provider,
+                        reputation=provider_analysis.reputation,
+                        fingerprint=provider_analysis.fingerprint,
+                        client_plan=resolved_plan,
+                        suggested_fixes=suggested_fixes,
+                        spam_trap_info=spam_trap_check,
+                        breach_info=breach_info,
+                    )
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # Si llegamos aquí: domain_result.valid=True O error_type permite continuar
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            logger.info(
+                f"[{validation_id}] Proceeding to next validation steps | "
+                f"domain_valid={domain_result.valid}"
+            )
+
             
             # ============================================================
-            # PASO 4A: Detectar Role Emails
+            # PASO 6: Detectar Role Emails
             # ============================================================
             from app.providers import detect_role_email
-
-            role_email_info = detect_role_email(normalized_email)
+            
+            role_email_info = detect_role_email(email_normalized)
             logger.info(
                 f"[{validation_id}] Role email check | "
                 f"Is role: {role_email_info.get('is_role_email')} | "
                 f"Type: {role_email_info.get('role_type')}"
             )
-
+            
             if role_email_info.get("is_role_email"):
                 logger.warning(f"[{validation_id}] Role email detected: {role_email_info['role_type']}")
             
             # ============================================================
-            # PASO 4B: Realizar validación SMTP
+            # PASO 7: Realizar validación SMTP
             # ============================================================
             smtp_result = await self._perform_smtp_validation(
-                normalized_email,
+                email_normalized,
                 domain_result.mx_host,
                 check_smtp,
                 plan,
@@ -842,7 +1140,7 @@ class EmailValidationEngine:
             )
             
             # ============================================================
-            # PASO 6: Convertir reputation de forma segura
+            # PASO 8: Convertir reputation de forma segura
             # ============================================================
             try:
                 if provider_analysis.reputation is None:
@@ -861,21 +1159,19 @@ class EmailValidationEngine:
                 safe_reputation = 0.5
             
             # ============================================================
-            # PASO 7: Ajustar risk_score si está en breach
+            # PASO 9: Ajustar risk_score si está en breach
             # ============================================================
             initial_risk_score = None
             if breach_info and breach_info.get("in_breach"):
-                initial_risk_score = min(1.0, (safe_reputation if not safe_reputation else 0.5) + 0.3)
+                initial_risk_score = min(1.0, safe_reputation + 0.3)
                 logger.warning(f"[{validation_id}] Risk score increased due to breach")
-
             
             # ============================================================
-            # PASO 7.5: Determinar si se usó cache en algún paso
+            # PASO 10: Determinar si se usó cache
             # ============================================================
-            # Determinar si esta validación completa ya fue procesada antes
-            validation_cache_key = f"email_validation_full:{normalized_email}"
+            validation_cache_key = f"email_validation_full:{email_normalized}"
             full_validation_cached = False
-
+            
             try:
                 if redis:
                     # Verificar si esta validación completa existe en caché
@@ -886,26 +1182,30 @@ class EmailValidationEngine:
                     if not full_validation_cached:
                         # Guardar en caché por 1 hora
                         await redis.setex(validation_cache_key, 3600, "1")
-                        logger.debug(f"First validation for {normalized_email}, marking in cache")
+                        logger.debug(f"First validation for {email_normalized}, marking in cache")
                     else:
-                        logger.debug(f"Validation cache HIT for {normalized_email}")
+                        logger.debug(f"Validation cache HIT for {email_normalized}")
             except Exception as cache_err:
                 logger.debug(f"Cache check failed: {cache_err}")
                 full_validation_cached = False
-
-            # Determinar cache_used basado en validación completa
+            
             # Solo marcar como cached si esta VALIDACIÓN COMPLETA ya se ejecutó antes
             cache_used = full_validation_cached
             
             # ============================================================
-            # PASO 7.8: DETECT CATCH-ALL (solo si check_smtp=true)
+            # PASO 11: DETECT CATCH-ALL (solo si check_smtp=true)
             # ============================================================
-            catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'not_checked', 'details': 'Skipped'}
+            catch_all_info = {
+                'is_catch_all': False, 
+                'confidence': 0.0, 
+                'method': 'not_checked', 
+                'details': 'Skipped'
+            }
             
             if check_smtp:
                 try:
                     # Extract domain from email
-                    domain = normalized_email.split('@')[-1]
+                    domain = email_normalized.split('@')[-1]
                     
                     # Run catch-all detection with timeout
                     catch_all_info = await asyncio.wait_for(
@@ -920,64 +1220,160 @@ class EmailValidationEngine:
                         f"Confidence: {catch_all_info.get('confidence'):.2f} | "
                         f"Method: {catch_all_info.get('method')}"
                     )
-                    
+                
                 except asyncio.TimeoutError:
                     logger.warning(f"[{validation_id}] Catch-all detection timeout")
-                    catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'timeout', 'details': 'Timeout'}
+                    catch_all_info = {
+                        'is_catch_all': False, 
+                        'confidence': 0.0, 
+                        'method': 'timeout', 
+                        'details': 'Timeout'
+                    }
                 
                 except Exception as e:
                     logger.error(f"[{validation_id}] Catch-all detection error: {e}")
-                    catch_all_info = {'is_catch_all': False, 'confidence': 0.0, 'method': 'error', 'details': str(e)[:100]}
+                    catch_all_info = {
+                        'is_catch_all': False, 
+                        'confidence': 0.0, 
+                        'method': 'error', 
+                        'details': str(e)[:100]
+                    }
             else:
                 logger.debug(f"[{validation_id}] Catch-all check skipped (check_smtp=false)")
             
             # ============================================================
-            # PASO 7.9: CALCULAR UNIFIED RISK SCORING (0-100)
+            # PASO 12: CALCULAR RISK ASSESSMENT
             # ============================================================
             # Extract domain for toxic domain check
-            domain = normalized_email.split('@')[-1] if '@' in normalized_email else ''
+            domain = email_normalized.split('@')[-1] if '@' in email_normalized else ''
             is_toxic = is_abuse_domain(domain) if domain else False
             
-            # Preparar datos para RiskScorer
-            validation_data = {
-                'valid': True,
-                'syntax_valid': True,  # Si llegamos aquí, syntax es válida
-                'smtp_checked': smtp_result["checked"],
-                'disposable': False,  # Ya fue filtrado antes
-                'role_based': role_email_info.get('is_role_email', False),
-                'catch_all': catch_all_info.get('is_catch_all', False),  # ✅ REAL VALUE
-                'toxic_domain': is_toxic,  # ✅ REAL VALUE
-            }
+            # Obtener el estado SMTP
+            smtp_status = smtp_result.get("status") or ("attempted" if smtp_result.get("checked") else "skipped_not_requested")
+            is_restricted = bool(smtp_result.get("is_restricted", False))
             
-            # Calcular unified risk score
-            unified_risk = RiskScorer.calculate_risk(
-                validation_result=validation_data,
-                spam_trap_result=spam_trap_check,
-                breach_result=breach_info
+            # 🔹 NUEVO: Determinar valid final basado en domain_result
+            # valid=True si formato OK y dominio existe (aunque tenga problemas)
+            # valid=False si no hay DNS o es disposable/spam trap/typo (ya se retornó antes)
+            
+            email_is_valid = domain_result.valid or domain_result.error_type in [
+                "no_mx_has_a",           # MX ausente pero A existe → válido
+                "unsafe_mx_host",        # MX inseguro → válido pero no entregable
+                "smtp_connection_unavailable",  # Problemas de red → válido
+                "mx_connection_failed",  # Problemas de red → válido
+            ]
+            
+            # Calcular risk assessment
+            risk = compute_risk_assessment(
+                valid=email_is_valid,
+                reputation=float(safe_reputation or 0.5),
+                smtp_status=smtp_status,
+                mailbox_exists=smtp_result.get("mailbox_exists"),
+                is_restricted=is_restricted,
+                spam_trap_info=spam_trap_check,
+                breach_info=breach_info,
+                role_email_info=role_email_info,
+                catch_all_info=catch_all_info,
+                toxic_domain=is_toxic,
             )
+            
+            # Convertir a rango 0-1 para compatibilidad
+            risk_score_01 = round(risk.score / 100.0, 3)
             
             logger.info(
-                f"[{validation_id}] Unified risk scoring | "
-                f"Score: {unified_risk.score}/100 | "
-                f"Level: {unified_risk.level} | "
-                f"Confidence: {unified_risk.confidence:.2%} | "
-                f"Factors: {unified_risk.factors}"
+                f"[{validation_id}] Risk assessment | "
+                f"Score: {risk.score}/100 | "
+                f"Level: {risk.level} | "
+                f"Confidence: {risk.confidence:.2%} | "
+                f"Factors: {risk.factors}"
             )
             
             # ============================================================
-            # PASO 8: Construir respuesta principal CON RISK SCORING
+            # PASO 13: Construir respuesta final CON RISK ASSESSMENT
             # ============================================================
+
+            # 🔹 LOG PREVIO: Estado antes de construir respuesta
+            logger.info(
+                f"[{validation_id}] Pre-response state | "
+                f"email_is_valid={email_is_valid} | "
+                f"domain_result.valid={domain_result.valid} | "
+                f"domain_result.error_type={domain_result.error_type} | "
+                f"domain_result.mx_host={domain_result.mx_host}"
+            )
+
+            # Determinar el mensaje detail basado en el resultado
+            if email_is_valid:
+                detail_message = "Email format and domain are valid"
+            else:
+                detail_message = domain_result.detail or "Email validation completed"
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # DETERMINAR error_type FINAL
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # error_type debe aparecer si:
+            # 1. valid=False (cualquier error de validación)
+            # 2. valid=True pero hay problemas de infraestructura específicos
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            final_error_type = None
+
+            if not email_is_valid:
+                # Si email no es válido, siempre incluir error_type
+                final_error_type = domain_result.error_type or "validation_failed"
+                logger.debug(
+                    f"[{validation_id}] error_type set (invalid email) | "
+                    f"domain_error={domain_result.error_type} | "
+                    f"final={final_error_type}"
+                )
+
+            elif domain_result.error_type in [
+                "no_mx_has_a",                   # MX ausente pero A existe
+                "unsafe_mx_host",                # MX apunta a localhost/privado
+                "smtp_connection_unavailable",   # Problema de conectividad
+                "mx_connection_failed",          # MX inalcanzable
+            ]:
+                # ✅ Casos especiales: email válido pero con problemas de infraestructura
+                final_error_type = domain_result.error_type
+                logger.info(
+                    f"[{validation_id}] error_type set (infrastructure issue) | "
+                    f"error_type={final_error_type} | "
+                    f"email_is_valid={email_is_valid}"
+                )
+
+            else:
+                # Email válido sin problemas o con problemas que no requieren error_type
+                logger.debug(
+                    f"[{validation_id}] No error_type (clean validation) | "
+                    f"email_is_valid={email_is_valid} | "
+                    f"domain_error_type={domain_result.error_type}"
+                )
+
+            # 🔹 LOG FINAL: Qué se va a pasar a ResponseBuilder
+            logger.info(
+                f"[{validation_id}] Building response | "
+                f"valid={email_is_valid} | "
+                f"error_type={final_error_type} | "
+                f"risk_score={risk_score_01} | "
+                f"mx_server={domain_result.mx_host}"
+            )
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # CONSTRUIR RESPUESTA CON ResponseBuilder
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
             response = await ResponseBuilder.build_validation_response(
-                email=normalized_email,
+                email=email_normalized,
                 start_time=start_time,
-                valid=True,
+                valid=email_is_valid,
                 validation_id=validation_id,
-                detail="Email format and domain are valid",
-                status_code=status.HTTP_200_OK,
+                detail=detail_message,
+                status_code=status.HTTP_200_OK,  # ✅ SIEMPRE 200 si input fue procesable
+                error_type=final_error_type,      # ✅ Usar el error_type calculado
                 smtp_checked=smtp_result["checked"],
                 mx_server=domain_result.mx_host,
                 mailbox_exists=smtp_result["mailbox_exists"],
                 skip_reason=smtp_result["skip_reason"],
+                is_restricted=is_restricted,
                 provider=provider_analysis.provider,
                 fingerprint=provider_analysis.fingerprint,
                 reputation=safe_reputation,
@@ -992,71 +1388,115 @@ class EmailValidationEngine:
                 dmarc_status="valid" if provider_analysis.dns_auth.dmarc and provider_analysis.dns_auth.dmarc != "no-dmarc" else "not_found",
                 dmarc_record=provider_analysis.dns_auth.dmarc if include_raw_dns else None,
                 smtp_detail=smtp_result["detail"],
-                risk_score=initial_risk_score,
+                risk_score=risk_score_01,
                 cache_used=cache_used,
                 client_plan=resolved_plan,
                 suggested_fixes=suggested_fixes,
                 breach_info=breach_info,
-                role_email_info=role_email_info,
+                role_email_info=role_email_info,  # ✅ CRÍTICO para status="risky" en role emails
                 spam_trap_info=spam_trap_check,
             )
-            
-            # ========================================
-            # AGREGAR UNIFIED RISK SCORING A RESPONSE
-            # ========================================
-            response_dict = json.loads(response.body.decode())
-            response_dict["risk_assessment"] = {
-                "score": unified_risk.score,
-                "level": unified_risk.level,
-                "factors": unified_risk.factors,
-                "explanation": unified_risk.explanation,
-                "confidence": round(unified_risk.confidence, 3)
-            }
-            
-            # Actualizar response con nueva información
-            response = JSONResponse(
-                status_code=response.status_code,
-                content=response_dict
-            )
-                        
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # AGREGAR RISK ASSESSMENT AL JSON DE RESPUESTA
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            try:
+                response_dict = json.loads(response.body.decode())
+                
+                # Añadir risk_assessment detallado
+                response_dict["risk_assessment"] = {
+                    "score": risk.score,
+                    "level": risk.level,
+                    "factors": risk.factors,
+                    "explanation": risk.explanation,
+                    "confidence": round(risk.confidence, 3)
+                }
+                
+                # Mantener consistencia con risk_score (0-1 scale)
+                response_dict["risk_score"] = risk_score_01
+                
+                # 🔹 VERIFICACIÓN: Asegurar que error_type está presente si debe estarlo
+                if final_error_type and "error_type" not in response_dict:
+                    logger.warning(
+                        f"[{validation_id}] error_type lost in ResponseBuilder | "
+                        f"Expected: {final_error_type} | Injecting manually"
+                    )
+                    response_dict["error_type"] = final_error_type
+                
+                # Actualizar response con nueva información
+                response = JSONResponse(
+                    status_code=response.status_code,
+                    content=response_dict
+                )
+                
+                # 🔹 LOG DE CONFIRMACIÓN: Qué se está devolviendo
+                logger.info(
+                    f"[{validation_id}] Response built successfully | "
+                    f"HTTP {response.status_code} | "
+                    f"valid={response_dict.get('valid')} | "
+                    f"status={response_dict.get('status')} | "
+                    f"error_type={response_dict.get('error_type')} | "
+                    f"risk_score={response_dict.get('risk_score')}"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"[{validation_id}] Failed to add risk_assessment to response: {e}",
+                    exc_info=True
+                )
+                # Si falla, devolver response original sin risk_assessment
+                pass
+
             await self.update_validation_metrics(request, response, plan, start_time)
-            logger.info(f"Validation {validation_id} completed successfully")
-            
+            logger.info(f"[{validation_id}] Validation completed successfully")
+
             return response
-        
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # EXCEPTION HANDLERS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
         except APIException as e:
-            elapsed = time.time() - start_time
-            logger.warning(f"Validation error (APIException): {e.detail} | Elapsed: {elapsed:.2f}s")
-            
-            return await self.handle_validation_error(
-                email=email,
-                start_time=start_time,
-                request=request,
-                plan=plan,
-                error=e,
-                validation_id=validation_id,
-                spam_trap_info=spam_trap_check,  # ← Pasar incluso en errores
-            )
-        
+                elapsed = time.time() - start_time
+                logger.warning(
+                    f"[{validation_id}] Validation error (APIException) | "
+                    f"Detail: {e.detail} | Elapsed: {elapsed:.2f}s"
+                )
+                
+                return await self.handle_validation_error(
+                    email=email,
+                    start_time=start_time,
+                    request=request,
+                    plan=plan,
+                    error=e,
+                    validation_id=validation_id,
+                    spam_trap_info=spam_trap_check,
+                )
+
         except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(
-                f"Unexpected error in validation: {type(e).__name__}: {str(e)[:200]} | Elapsed: {elapsed:.2f}s",
-                exc_info=True,
-            )
-            
-            return await self.handle_validation_error(
-                email=email,
-                start_time=start_time,
-                request=request,
-                plan=plan,
-                error=e,
-                validation_id=validation_id,
-                spam_trap_info=spam_trap_check,  # ← Pasar incluso en errores
-            )
-        
+                elapsed = time.time() - start_time
+                logger.error(
+                    f"[{validation_id}] Unexpected error in validation | "
+                    f"Type: {type(e).__name__} | "
+                    f"Message: {str(e)[:200]} | "
+                    f"Elapsed: {elapsed:.2f}s",
+                    exc_info=True,
+                )
+                
+                return await self.handle_validation_error(
+                    email=email,
+                    start_time=start_time,
+                    request=request,
+                    plan=plan,
+                    error=e,
+                    validation_id=validation_id,
+                    spam_trap_info=spam_trap_check,
+                )
+
         finally:
-            await self._cleanup_concurrency_limits(redis, user_id)
+                await self._cleanup_concurrency_limits(redis, user_id)
+
 
 
     async def check_concurrency_limits(self, redis, user_id: str, plan: str) -> None:
@@ -1133,62 +1573,81 @@ class EmailValidationEngine:
 
     async def _validate_email_format(self, email: str) -> str:
         """✅ Valida formato de email con mensajes más claros."""
-        trimmed = email.strip()
-        if not trimmed:
+        # Limpiar y validar entrada básica
+        raw = (email or "").strip()
+        if not raw:
             raise APIException(
                 detail="Email cannot be empty",
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 error_type="empty_email"
             )
         
-        if email != trimmed:
-            # ✅ MENSAJE MÁS CLARO
+        # Verificar formato básico
+        if "@" not in raw:
             raise APIException(
-                detail="Email has leading or trailing whitespace. "
-                    "Please remove spaces at the beginning or end. "
-                    f"You provided: '{email}' but expected: '{trimmed}'",
+                detail="Invalid email format: missing @",
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                error_type="invalid_format_whitespace"
+                error_type="invalid_format"
             )
         
         try:
-            # Validación adicional de longitudes RFC 5321 ANTES de email-validator
-            if "@" in email:
-                local, domain = email.rsplit("@", 1)
-                
-                # RFC 5321: Local-part máximo 64 caracteres
-                if len(local) > 64:
+            # Separar local y dominio
+            local, domain = raw.rsplit("@", 1)
+            
+            # Validar longitud del local-part (RFC 5321)
+            if len(local) > 64:
+                raise APIException(
+                    detail=f"Local-part too long: {len(local)} characters (max 64)",
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    error_type="invalid_format"
+                )
+            
+            # Normalizar dominio a IDNA ASCII (soporta IDN como español.com)
+            try:
+                ascii_domain = _idna_ascii(domain)
+                if not ascii_domain:
                     raise APIException(
-                        detail=f"Local-part too long: {len(local)} characters (max 64)",
+                        detail="Invalid email domain",
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                         error_type="invalid_format"
                     )
                 
-                # RFC 5321: Dominio máximo 253 caracteres
-                if len(domain) > 253:
+                # Validar longitud del dominio (RFC 5321)
+                if len(ascii_domain) > 253:
                     raise APIException(
-                        detail=f"Domain too long: {len(domain)} characters (max 253)",
+                        detail=f"Domain too long: {len(ascii_domain)} characters (max 253 after IDNA encoding)",
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                         error_type="invalid_format"
                     )
                 
-                # RFC 1035: Cada label de dominio máximo 63 caracteres
-                for label in domain.split("."):
+                # Validar etiquetas del dominio (RFC 1035)
+                for label in ascii_domain.split("."):
                     if len(label) > 63:
                         raise APIException(
                             detail=f"Domain label too long: '{label}' ({len(label)} characters, max 63)",
                             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                             error_type="invalid_format"
                         )
+                
+                # Construir email normalizado
+                normalized_input = f"{local}@{ascii_domain}"
+                
+            except (ValueError, UnicodeError) as e:
+                raise APIException(
+                    detail=f"Invalid domain format: {str(e)}",
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    error_type="invalid_format"
+                )
             
-            # Ahora sí, usar email-validator
+            # Validar con email-validator usando el dominio normalizado
             valid_email = validate_email_lib(
-                email,
+                normalized_input,
                 allow_smtputf8=True,
                 check_deliverability=False,
                 test_environment=get_settings().testing_mode
             )
             return valid_email.normalized
+            
         except EmailNotValidError as e:
             raise APIException(
                 detail=f"Invalid email format: {str(e)}",
@@ -1198,7 +1657,7 @@ class EmailValidationEngine:
 
 
 
-    async def _validate_domain(self, email: str, redis) -> VerificationResult:
+    async def _validate_domain(self, email: str, redis, testing_mode: bool = False) -> VerificationResult:
         """
         ✅ Valida que el dominio existe y tiene registros MX válidos.
         
@@ -1206,8 +1665,8 @@ class EmailValidationEngine:
             VerificationResult con:
             - valid: bool → True si dominio tiene MX records
             - detail: str → Descripción del resultado
-            - mxhost: Optional[str] → Primer MX record si es válido
-            - errortype: Optional[str] → Tipo de error si falla
+            - mx_host: Optional[str] → Primer MX record si es válido
+            - error_type: Optional[str] → Tipo de error si falla
         
         Comportamiento:
             - Si dominio es reservado (example.com, test.com) → valid: False
@@ -1215,7 +1674,17 @@ class EmailValidationEngine:
             - Si dominio no tiene MX records → valid: False
             - Si dominio tiene MX records → valid: True (válido para recibir emails)
         """
-        
+
+        from app.providers import RiskScorer
+        # Validar formato de email
+        try:
+            domain = email.split('@')[-1].lower()
+        except (IndexError, AttributeError):
+            return VerificationResult(
+                valid=False,
+                detail="Invalid email format",
+                error_type="invalid_format"
+            )
         # Extraer dominio del email
         _, domain = email.split("@")
         
@@ -1229,15 +1698,16 @@ class EmailValidationEngine:
             # - Verifica si es dominio disposable
             # - Intenta resolver MX records
             # - Maneja caché automáticamente
+            # - Verifica TLDs especiales según testing_mode
             
-            result = await cached_check_domain(domain)
+            result = await cached_check_domain(domain, testing_mode=testing_mode)
             
             # result ya es VerificationResult con estructura:
             # {
             #     "valid": bool,
             #     "detail": str,
-            #     "mxhost": Optional[str],
-            #     "errortype": Optional[str]
+            #     "mx_host": Optional[str],
+            #     "error_type": Optional[str]
             # }
             
             if result.valid:
@@ -1291,17 +1761,23 @@ class EmailValidationEngine:
                 "skip_reason": f"Domain {domain} is restricted (does not accept SMTP verification)",
                 "mx_server": mx_host,
                 "detail": None,
+                "is_restricted": True,
+                "status": "skipped_restricted"
             }
         
         # ✅ 2. Verificar plan (FREE no tiene SMTP)
-        if plan.upper() == "FREE":
+        plan_upper = (plan or "FREE").upper()
+        if plan_upper == "FREE":
             return {
                 "checked": False,
                 "mailbox_exists": None,
                 "skip_reason": "SMTP check not available in FREE plan",
                 "mx_server": mx_host,
                 "detail": None,
+                "is_restricted": False,
+                "status": "skipped_plan",
             }
+
         
         # ✅ 3. Verificar si usuario solicitó SMTP
         if not check_smtp or not mx_host:
@@ -1311,6 +1787,8 @@ class EmailValidationEngine:
                 "skip_reason": "SMTP check not requested or no MX host",
                 "mx_server": mx_host,
                 "detail": None,
+                "is_restricted": False,
+                "status": "skipped_not_requested",
             }
         
         # ✅ 4. EJECUTAR SMTP VALIDATION EN PRODUCCIÓN (sin Docker bypass)
@@ -1353,6 +1831,8 @@ class EmailValidationEngine:
                 "skip_reason": None,
                 "mx_server": mx_host,
                 "detail": detail,
+                "is_restricted": False,
+                "status": "attempted",
             }
         
         except asyncio.TimeoutError:
@@ -1363,6 +1843,8 @@ class EmailValidationEngine:
                 "skip_reason": "smtp_timeout",
                 "mx_server": mx_host,
                 "detail": "SMTP verification timed out (30s)",
+                "is_restricted": False,
+                "status": "timeout"
             }
         
         except Exception as e:
@@ -1373,6 +1855,8 @@ class EmailValidationEngine:
                 "skip_reason": "smtp_error",
                 "mx_server": mx_host,
                 "detail": f"SMTP verification failed: {str(e)[:100]}",
+                "is_restricted": False,
+                "status": "error"
             }
 
 
@@ -1384,7 +1868,8 @@ class EmailValidationEngine:
         plan: str,
         error: Exception,
         validation_id: Optional[str] = None,
-        spam_trap_info: Optional[Dict[str, Any]] = None,  # ← NUEVO PARÁMETRO
+        spam_trap_info: Optional[Dict[str, Any]] = None,
+        testing_mode: bool = False,  # ← Añade este parámetro con un valor por defecto
     ) -> JSONResponse:
         """
         ✅ Maneja errores de validación con respuesta consistente.
@@ -1400,6 +1885,21 @@ class EmailValidationEngine:
         
         # ✅ Extraer plan del JWT
         client_plan = (plan or "").upper() or self._extract_plan_from_request(request)
+        
+        # ✅ Handle special TLD errors
+        if isinstance(error, ValueError) and "special-use TLD" in str(error):
+            return await ResponseBuilder.build_validation_response(
+                email=email,
+                start_time=start_time,
+                valid=False,
+                detail="Special-use TLDs not allowed in production",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                error_type="invalid_domain",
+                client_plan=client_plan or "UNKNOWN",
+                smtp_checked=False,
+                mailbox_exists=None,
+                validation_id=validation_id or str(uuid.uuid4())
+            )
         
         # ✅ PASO 1: Determinar tipo de error
         if isinstance(error, APIException):
@@ -2111,12 +2611,13 @@ async def validate_email_endpoint(
     ✅ Endpoint de validación de email con timeout y fallback robusto.
     
     Cambios principales:
-    - Timeout explícito por plan (FREE: 10s, PREMIUM: 30s, ENTERPRISE: 60s)
+    - Timeout explícito por plan (FREE: 15s, PREMIUM: 45s, ENTERPRISE: 60s)
     - Fallback BASIC seguro si se vence
     - SIEMPRE retorna JSONResponse válida
     - client_plan en TODAS las respuestas
     - spam_trap_check ejecutado ANTES del timeout para estar disponible en fallback
     - Manejo de errores con ResponseBuilder
+    - ✅ NUEVO: Soporte para TLD .test en testing_mode
     """
     
     start_time = time.time()
@@ -2124,6 +2625,19 @@ async def validate_email_endpoint(
     email = (req_body.email or "").strip()
     check_smtp = getattr(req_body, "check_smtp", False)
     include_raw_dns = getattr(req_body, "include_raw_dns", False)
+    testing_mode = getattr(req_body, "testing_mode", False)
+
+    # Validar testing_mode en producción
+    if testing_mode and os.getenv("ENVIRONMENT") == "production":
+        return await ResponseBuilder.build_validation_response(
+            email=email,
+            start_time=start_time,
+            valid=False,
+            status_code=status.HTTP_403_FORBIDDEN,
+            error_type="testing_mode_forbidden",
+            detail="Testing mode is not allowed in production",
+            client_plan="UNKNOWN"
+        )
     
     user_id = current_client.sub
     plan_upper = (current_client.plan or "FREE").upper()
@@ -2131,15 +2645,39 @@ async def validate_email_endpoint(
     # Determinar si está en Docker
     is_docker = os.getenv("ENVIRONMENT", "").lower() == "docker"
     
+    safe_email = mask_email(email)
     logger.info(
-        f"Email validation | User: {user_id} | Plan: {plan_upper} | Email: {email} | "
-        f"Env: {'docker' if is_docker else 'production'} | SMTP: {check_smtp} | DNS: {include_raw_dns}"
+        f"Email validation | User: {user_id} | Plan: {plan_upper} | "
+        f"Email: {safe_email} | Env: {'docker' if is_docker else 'production'} | "
+        f"SMTP: {check_smtp} | DNS: {include_raw_dns} | Testing: {testing_mode}"
     )
     
     email_normalized = None
     is_valid = False
     domain = "unknown"
-    spam_trap_check = None  # ← NUEVO: Variable para almacenar resultado
+    spam_trap_check = None  # ← Variable para almacenar resultado
+    
+    # ============================================================
+    # ✅ NUEVO: VERIFICACIÓN TEMPRANA DE .test TLD EN TESTING MODE
+    # ============================================================
+    # Extraer dominio para verificación temprana (antes de validación completa)
+    if email and "@" in email:
+        try:
+            _, temp_domain = email.rsplit("@", 1)
+            temp_domain = temp_domain.strip().lower()
+            
+            # Si es testing_mode y termina en .test, registrar en log
+            if testing_mode and temp_domain.endswith('.test'):
+                logger.info(
+                    f"Testing mode enabled: allowing special-use TLD .test | "
+                    f"Domain: {temp_domain} | Request: {request_id}"
+                )
+                # NO bloquear aquí - permitir que continúe el flujo normal
+                # La validación en validation.py respetará testing_mode
+        except Exception as domain_extract_err:
+            # Si falla la extracción, continuar normalmente
+            logger.debug(f"Early domain extraction failed: {domain_extract_err}")
+    # ============================================================
     
     try:
         # ✅ VALIDACIÓN BÁSICA DE FORMATO
@@ -2153,7 +2691,7 @@ async def validate_email_endpoint(
         email_normalized = email.lower().strip()
         
         # ============================================================
-        # ✅ NUEVO: EJECUTAR SPAM TRAP CHECK ANTES DEL TIMEOUT WRAPPER
+        # ✅ EJECUTAR SPAM TRAP CHECK ANTES DEL TIMEOUT WRAPPER
         # ============================================================
         try:
             # Validar formato más detallado
@@ -2165,7 +2703,10 @@ async def validate_email_endpoint(
                 
                 # Ejecutar spam trap check ANTES del timeout
                 from app.providers import SpamTrapDetector
-                spam_trap_check = await SpamTrapDetector.is_spam_trap(email_normalized)
+                spam_trap_check = await SpamTrapDetector.is_spam_trap(
+                    email_normalized,
+                    testing_mode=testing_mode  # ← Pasar testing_mode
+                )
                 
                 logger.info(
                     f"{request_id} | Pre-validation spam trap check | "
@@ -2202,6 +2743,7 @@ async def validate_email_endpoint(
                     redis=redis,
                     user_id=user_id,
                     plan=plan_upper,
+                    testing_mode=testing_mode  # ← Pasar testing_mode
                 ),
                 timeout=timeout_seconds
             )
@@ -2265,7 +2807,8 @@ async def validate_email_endpoint(
                 validation_id=request_id,
                 cache_used=False,
                 client_plan=plan_upper,
-                spam_trap_info=spam_trap_check,  # ← CRÍTICO: Incluir spam trap check
+                spam_trap_info=spam_trap_check,
+                testing_mode=testing_mode  # ← Pasar testing_mode
             )
             
             timeout_response.headers["X-Request-ID"] = request_id
@@ -2301,7 +2844,8 @@ async def validate_email_endpoint(
             plan=plan_upper,
             error=api_error,
             validation_id=request_id,
-            spam_trap_info=spam_trap_check,  # ← Incluir incluso en errores
+            spam_trap_info=spam_trap_check,
+            testing_mode=testing_mode  # ← Pasar testing_mode
         )
         
         error_response.headers["X-Request-ID"] = request_id
@@ -2325,7 +2869,8 @@ async def validate_email_endpoint(
             plan=plan_upper,
             error=e,
             validation_id=request_id,
-            spam_trap_info=spam_trap_check,  # ← Incluir incluso en errores inesperados
+            spam_trap_info=spam_trap_check,
+            testing_mode=testing_mode  # ← Pasar testing_mode
         )
         
         error_response.headers["X-Request-ID"] = request_id

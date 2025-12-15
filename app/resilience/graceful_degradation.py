@@ -1,3 +1,5 @@
+from typing import List
+
 """
 Graceful Degradation for Non-Critical Features
 

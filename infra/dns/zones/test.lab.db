@@ -1,0 +1,57 @@
+$ORIGIN test.lab.
+$TTL 3600
+
+@       IN      SOA     ns1.test.lab. admin.test.lab. (
+                        2025121401    ; Serial
+                        3600          ; Refresh
+                        1800          ; Retry
+                        1209600       ; Expire
+                        3600          ; Negative Cache TTL
+)
+
+; Name servers
+@       IN      NS      ns1.test.lab.
+ns1     IN      A       172.20.0.10
+
+; Mail server (MailHog)
+@       IN      MX 10   mail.test.lab.
+mail    IN      A       172.20.0.20
+
+; ============ Test domains ============
+
+; Valid domain: MX válido, SPF, DKIM, DMARC (NO usar 127.0.0.1)
+valid           IN      A       172.20.0.20
+valid           IN      MX 10   mail.test.lab.
+valid           IN      TXT     "v=spf1 mx -all"
+_dmarc.valid    IN      TXT     "v=DMARC1; p=reject; sp=reject; adkim=s; aspf=s;"
+mail._domainkey.valid IN TXT    "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0123456789..."
+
+; Domain without MX records (solo A)
+nomx            IN      A       172.20.0.51
+
+; MX pointing to localhost (inseguro, debe ser bloqueado)
+localhost-mx    IN      A       172.20.0.52
+localhost-mx    IN      MX 10   localhost.
+
+; Bad SPF
+badspf          IN      A       172.20.0.20
+badspf          IN      MX 10   mail.test.lab.
+badspf          IN      TXT     "v=spf1 -all"
+
+; No DMARC
+nodmarc         IN      A       172.20.0.20
+nodmarc         IN      MX 10   mail.test.lab.
+nodmarc         IN      TXT     "v=spf1 mx -all"
+; (no hay registro _dmarc)
+
+; Bad DKIM
+baddkim         IN      A       172.20.0.20
+baddkim         IN      MX 10   mail.test.lab.
+baddkim         IN      TXT     "v=spf1 mx -all"
+mail._domainkey.baddkim IN TXT  "v=DKIM1; invalid-key"
+
+; DMARC with policy=none
+dmarcreport     IN      A       172.20.0.20
+dmarcreport     IN      MX 10   mail.test.lab.
+dmarcreport     IN      TXT     "v=spf1 mx -all"
+_dmarc.dmarcreport IN   TXT     "v=DMARC1; p=none;"

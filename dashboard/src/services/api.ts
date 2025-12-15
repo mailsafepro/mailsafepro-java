@@ -1,100 +1,173 @@
-// src/services/api.ts
-import axios from "axios";
+/**
+ * Configuración y setup de Axios con interceptores
+ * Maneja autenticación, refresh tokens y errores
+ */
 
-// Crear instancia de axios
+import axios, { AxiosError, AxiosResponse } from 'axios';
+import { API_CONFIG } from '../config/api.config';
+import {
+  getAccessToken,
+  getRefreshToken,
+  setTokens,
+  redirectToLogin,
+} from '../utils/token.utils';
+import type {
+  RefreshTokenResponse,
+  QueuedRequest,
+  CustomAxiosRequestConfig,
+} from '../types/api.types';
+
+/**
+ * Instancia de Axios configurada
+ */
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL,
+  baseURL: API_CONFIG.BASE_URL,
+  timeout: API_CONFIG.TIMEOUT,
   headers: {
-    "Content-Type": "application/json",
+    'Content-Type': 'application/json',
   },
 });
 
-// Interceptor para añadir token a las solicitudes
-api.interceptors.request.use(config => {
-  const token = sessionStorage.getItem("token");
-  
-  if (token) {
-    config.headers["Authorization"] = `Bearer ${token}`;
-  }
-  
-  return config;
-});
-
-// Interceptor para manejar errores y refrescar tokens
+// Estado para manejo de refresh token
 let isRefreshing = false;
-let refreshQueue: { resolve: (value?: any) => void; reject: (reason?: any) => void }[] = [];
+let refreshQueue: QueuedRequest[] = [];
 
+/**
+ * Procesa la cola de requests pendientes
+ * @param error - Error opcional para rechazar todos
+ */
+const processQueue = (error: Error | null = null): void => {
+  refreshQueue.forEach((promise) => {
+    if (error) {
+      promise.reject(error);
+    } else {
+      promise.resolve();
+    }
+  });
+
+  refreshQueue = [];
+};
+
+/**
+ * Interceptor de request: Añade token de autorización
+ */
+api.interceptors.request.use(
+  (config: CustomAxiosRequestConfig) => {
+    const token = getAccessToken();
+
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    return config;
+  },
+  (error: AxiosError) => {
+    console.error('Request interceptor error:', error);
+    return Promise.reject(error);
+  }
+);
+
+/**
+ * Interceptor de response: Maneja errores y refresh de tokens
+ */
 api.interceptors.response.use(
-  response => response,
-  async (error) => {
-    const originalRequest = error.config;
-    
+  (response: AxiosResponse) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config as CustomAxiosRequestConfig;
+
+    if (!originalRequest) {
+      return Promise.reject(error);
+    }
+
+    // Error 401: Token expirado
     if (error.response?.status === 401 && !originalRequest._retry) {
-      if (originalRequest.url.includes('/auth/refresh')) {
-        // Manejar error de refresh recursivo
-        sessionStorage.removeItem("token");
-        sessionStorage.removeItem("refresh_token");
-        sessionStorage.removeItem("user_email");
-        window.location.href = "/login";
+      // Prevenir loop infinito en endpoint de refresh
+      if (originalRequest.url?.includes(API_CONFIG.REFRESH_ENDPOINT)) {
+        console.error('Refresh token inválido o expirado');
+        redirectToLogin();
         return Promise.reject(error);
       }
-      
+
+      // Si no hay refresh en progreso, iniciar refresh
       if (!isRefreshing) {
         isRefreshing = true;
         originalRequest._retry = true;
-        const refreshToken = sessionStorage.getItem("refresh_token");
-        
+
+        const refreshToken = getRefreshToken();
+
         if (!refreshToken) {
-          sessionStorage.removeItem("token");
-          sessionStorage.removeItem("user_email");
-          window.location.href = "/login";
+          console.error('No refresh token available');
+          redirectToLogin();
           return Promise.reject(error);
         }
-        
+
         try {
-          const response = await axios.post(
-            `${import.meta.env.VITE_API_BASE_URL}/auth/refresh`,
+          console.log('🔄 Refrescando access token...');
+
+          // Realizar request de refresh
+          const response = await axios.post<RefreshTokenResponse>(
+            `${API_CONFIG.BASE_URL}${API_CONFIG.REFRESH_ENDPOINT}`,
             { refresh_token: refreshToken }
           );
-          
-          // Actualizar tokens
-          sessionStorage.setItem("token", response.data.access_token);
-          sessionStorage.setItem("refresh_token", response.data.refresh_token);
-          
-          // Actualizar header para la solicitud original
-          api.defaults.headers.common['Authorization'] = `Bearer ${response.data.access_token}`;
-          originalRequest.headers.Authorization = `Bearer ${response.data.access_token}`;
-          
-          // Reintentar solicitudes en cola
-          refreshQueue.forEach(({ resolve }) => resolve());
-          
-          // Reintentar solicitud original
+
+          const { access_token, refresh_token: new_refresh_token } = response.data;
+
+          // Guardar nuevos tokens
+          setTokens(access_token, new_refresh_token);
+
+          // Actualizar headers
+          if (api.defaults.headers.common) {
+            api.defaults.headers.common.Authorization = `Bearer ${access_token}`;
+          }
+
+          if (originalRequest.headers) {
+            originalRequest.headers.Authorization = `Bearer ${access_token}`;
+          }
+
+          console.log('✅ Token refrescado exitosamente');
+
+          // Procesar cola de requests pendientes
+          processQueue();
+
+          // Reintentar request original
           return api(originalRequest);
         } catch (refreshError) {
-          // Manejar error de refresh
-          refreshQueue.forEach(({ reject }) => reject(refreshError));
-          sessionStorage.removeItem("token");
-          sessionStorage.removeItem("refresh_token");
-          sessionStorage.removeItem("user_email");
-          window.location.href = "/login";
+          console.error('❌ Error al refrescar token:', refreshError);
+
+          // Rechazar todos los requests en cola
+          processQueue(refreshError as Error);
+
+          // Redirigir a login
+          redirectToLogin();
+
           return Promise.reject(refreshError);
         } finally {
           isRefreshing = false;
-          refreshQueue = [];
         }
       }
-      
-      // Encolar solicitudes mientras se refresca
+
+      // Si ya hay refresh en progreso, encolar el request
       return new Promise((resolve, reject) => {
-        refreshQueue.push({ resolve, reject });
-      }).then(() => {
-        originalRequest.headers.Authorization = `Bearer ${sessionStorage.getItem("token")}`;
-        return api(originalRequest);
+        refreshQueue.push({
+          resolve: () => {
+            if (originalRequest.headers) {
+              const token = getAccessToken();
+              if (token) {
+                originalRequest.headers.Authorization = `Bearer ${token}`;
+              }
+            }
+            resolve(api(originalRequest));
+          },
+          reject,
+        });
       });
     }
-    
+
+    // Otros errores
     return Promise.reject(error);
   }
 );
 
 export default api;
+
+

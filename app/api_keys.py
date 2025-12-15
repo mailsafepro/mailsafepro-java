@@ -44,7 +44,7 @@ from app.auth import (
 from app.logger import logger
 
 
-router = APIRouter(prefix="/api-keys", tags=["API Keys"])
+router = APIRouter(tags=["API Keys"])
 
 # =============================================================================
 # CONSTANTS

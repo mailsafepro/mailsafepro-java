@@ -52,6 +52,9 @@ from app.routes.logs_routes import router as logs_router
 from app.routes.webhooks_management import router as webhooks_mgmt_router
 from app.health_checks import router as health_router
 
+from app.audit.routes import router as audit_router
+
+
 # Import middlewares and utilities
 from app.exceptions import register_exception_handlers
 from app.metrics import instrument_app, mount_metrics_endpoint, Instrumentator
@@ -529,6 +532,17 @@ app = FastAPI(
 # Initialize distributed tracing (instruments FastAPI automatically)
 setup_tracing(app)
 
+
+from gemini_client import generate_text
+
+@app.get("/gemini")
+async def ask_gemini(prompt: str):
+    """
+    Llama a Gemini para generar texto a partir de un prompt
+    """
+    result = await generate_text(prompt)
+    return {"prompt": prompt, "response": result}
+
 # ✅ Phase 5: Payload Size Limit Middleware (DoS prevention)
 from app.security.payload_limits import PayloadSizeLimitMiddleware
 app.add_middleware(PayloadSizeLimitMiddleware)
@@ -716,6 +730,8 @@ app.include_router(logs_router, prefix="/logs", tags=["Logs"])
 app.include_router(webhooks_mgmt_router, prefix="/webhooks-management", tags=["Webhooks Management"])
 app.include_router(health_router, tags=["Health"])  # ✅ FIX: Incluir router de health_checks para /health
 
+app.include_router(audit_router, prefix="/admin")
+
 # ✅ Register exception handlers
 register_exception_handlers(app)
 
@@ -725,9 +741,17 @@ mount_metrics_endpoint(app)
 # ✅ Instrument app with Prometheus
 instrument_app(app)
 
-# ✅ SECURITY: Global IP rate limiting with FAIL-CLOSED strategy
-GLOBAL_RATE_LIMIT = 1000  # requests per window
-GLOBAL_RATE_WINDOW = 60   # seconds
+
+DEVELOPMENT_MODE = os.getenv("ENVIRONMENT", "development") == "development"
+
+if DEVELOPMENT_MODE:
+    # Desarrollo: Límites muy permisivos
+    GLOBAL_RATE_LIMIT = 50000   # 50k por hora
+    GLOBAL_RATE_WINDOW = 3600   # 1 hora
+else:
+    # Producción: Límites razonables
+    GLOBAL_RATE_LIMIT = 10000   # 10k por hora
+    GLOBAL_RATE_WINDOW = 3600   # 1 hora
 
 
 # ============================================================================

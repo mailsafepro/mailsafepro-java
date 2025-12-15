@@ -1170,6 +1170,9 @@ async def refresh_token(
             logger.warning("Refresh token revoked: %s", jti[:8])
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
         
+        # 4.1) Revocar el refresh token anterior para evitar reutilización
+        await revoke_refresh_token(jti, redis)
+        
         # 5) ✅ CRÍTICO: Obtener plan actualizado de Redis (no del token viejo)
         user_id = refresh_payload.get("sub")
         user_key = f"user:{user_id}"

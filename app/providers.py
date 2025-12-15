@@ -37,6 +37,7 @@ from ipwhois import IPWhois
 from app.validation import get_mx_records, dns_resolver, check_smtp_mailbox_safe
 from app.cache import UnifiedCache, AsyncTTLCache  # Unified Cache + AsyncTTLCache
 from app.pii_mask import mask_email
+from app.redis_client import REDIS_CLIENT
 
 
 async def query_mx_with_pref(domain: str):
@@ -248,8 +249,6 @@ GENERAL_CACHE = AsyncTTLCache(maxsize=config.general_cache_maxsize, ttl=config.g
 # -----------------------
 # Redis-backed cache adapter (optional)
 # -----------------------
-
-REDIS_CLIENT: Optional[RedisLike] = None
 
 def set_redis_client(redis_client: RedisLike) -> None:
     global REDIS_CLIENT
@@ -1094,17 +1093,18 @@ async def enhanced_dkim_check(domain: str) -> DKIMInfo:
             
             if answers:
                 for rdata in answers:
-                    for txt_string in rdata.strings:
-                        txt_str = txt_string.decode('utf-8', errors='ignore').strip()
-                        
-                        if 'v=dkim1' in txt_str.lower():
-                            # ✅ Encontrado: parsear e informar
-                            info = extract_dkim_parts(txt_str)
-                            info.selector = selector
-                            info.status = "valid"
-                            info.record = txt_str  # ← NUEVO: guardar el record completo
-                            logger.info(f"[DKIM] Found for {d} with selector '{selector}'")
-                            return info
+                    # Unir todos los chunks del registro TXT en un solo string
+                    txt_str = b''.join(rdata.strings).decode('utf-8', errors='ignore').strip()
+                    
+                    # Solo procesar si parece un registro DKIM
+                    if 'v=dkim1' in txt_str.lower():
+                        # ✅ Encontrado: parsear e informar
+                        info = extract_dkim_parts(txt_str)
+                        info.selector = selector
+                        info.status = "valid"
+                        info.record = txt_str
+                        logger.info(f"[DKIM] Found for {d} with selector '{selector}'")
+                        return info
         
         except (dns.exception.DNSException, Exception) as e:
             logger.debug(f"[DKIM] Selector '{selector}' failed: {str(e)[:100]}")
@@ -1504,15 +1504,23 @@ def levenshtein_distance(s1: str, s2: str) -> int:
     return previous_row[-1]
 
 
+# Agregar al inicio del archivo
+KNOWN_DISPOSABLES = {
+    'yopmail.com', 'tempmail.com', '10minutemail.com',
+    'guerrillamail.com', 'mailinator.com'
+}
+
 def check_typo_suggestion(email: str) -> Optional[Tuple[str, float]]:
-    """
-    Sugiere dominio si detecta typo.
-    Retorna (suggested_email, confidence) o None.
-    """
-    if "@" not in email:
+    """Sugiere dominio si detecta typo."""
+    if '@' not in email:
         return None
     
-    local, domain = email.rsplit("@", 1)
+    local_part, domain = email.split('@', 1)
+    
+    # Saltar si es un dominio desechable conocido
+    if domain in KNOWN_DISPOSABLES:
+        return None
+
     domain_lower = domain.lower()
     
     best_match = None
@@ -1522,7 +1530,8 @@ def check_typo_suggestion(email: str) -> Optional[Tuple[str, float]]:
     # Buscar en diccionario de dominios comunes
     for correct_domain, typo_list in COMMON_DOMAINS.items():
         for typo in typo_list:
-            if typo_lower := typo.lower():
+            typo_lower = typo.lower()
+            if typo_lower:
                 distance = levenshtein_distance(domain_lower, typo_lower)
                 
                 # Si el dominio introducido es el typo conocido
@@ -1532,7 +1541,7 @@ def check_typo_suggestion(email: str) -> Optional[Tuple[str, float]]:
                     confidence = similarity * 100
                     
                     if distance <= best_distance and confidence > best_confidence:
-                        best_match = f"{local}@{correct_domain}"
+                        best_match = f"{local_part}@{correct_domain}"
                         best_distance = distance
                         best_confidence = confidence
         
@@ -1544,7 +1553,7 @@ def check_typo_suggestion(email: str) -> Optional[Tuple[str, float]]:
             confidence = similarity * 100
             
             if confidence > best_confidence:
-                best_match = f"{local}@{correct_domain}"
+                best_match = f"{local_part}@{correct_domain}"
                 best_distance = distance
                 best_confidence = confidence
     
@@ -1755,15 +1764,28 @@ def detect_role_email(email: str) -> Dict[str, Any]:
         "confidence": float  # 0-1
     }
     """
-    if "@" not in email:
-        return {
-            "is_role_email": False,
-            "role_type": None,
-            "deliverability_risk": 0.0,
-            "confidence": 1.0
-        }
+    result = {
+        "is_role_email": False,
+        "role_type": None,
+        "deliverability_risk": 0.0,
+        "confidence": 0.0
+    }
     
-    local_part = email.split("@")[0].lower().strip()
+    if '@' not in email:
+        return result
+    
+    local_part = email.split('@')[0].lower()
+    
+    # Verificar patrones de alto riesgo
+    high_risk = ['abuse', 'spam', 'postmaster', 'nobody', 'trap', 'honeypot']
+    if any(role in local_part for role in high_risk):
+        result.update({
+            "is_role_email": True,
+            "role_type": "high_risk",
+            "deliverability_risk": 0.9,
+            "confidence": 0.95
+        })
+        return result
     
     # ✅ Búsqueda exacta
     if local_part in ROLE_EMAILS:
@@ -1827,13 +1849,29 @@ def detect_role_email(email: str) -> Dict[str, Any]:
 
 class SpamTrapDetector:
     """
-    Detecta spam traps (honeypots), dominios de abuso y emails tóxicos.
+    Detector de spam traps (honeypots) con scoring contextual multi-nivel.
     
-    Tipos de spam traps detectados:
-    - Pristine: Emails falsos creados solo para capturar spammers
-    - Recycled: Emails abandonados convertidos en traps
-    - Typo: Variaciones comunes de dominios populares (gmial.com, etc.)
-    - Role-based abuse: abuse@, spam@, postmaster@ en dominios sospechosos
+    Características:
+    - Detección de pristine traps (dominios creados solo para capturar spam)
+    - Detección de recycled traps (emails abandonados reutilizados)
+    - Detección de typo traps (dominios con typos comunes: gmial.com)
+    - Role-based abuse detection (abuse@, spam@, etc.)
+    - Exclusión de dominios de testing/desarrollo
+    - Cache interno para optimización
+    
+    Niveles de confianza:
+    - 1.0: Trap conocido (lista interna)
+    - 0.9: Typo trap o high-risk role + dominio sospechoso
+    - 0.7+: Dominio con patrones sospechosos
+    - 0.0: Email limpio
+    
+    Ejemplos:
+        >>> await SpamTrapDetector.is_spam_trap("test@honeypot.com")
+        {'is_spam_trap': True, 'confidence': 1.0, 'trap_type': 'pristine'}
+        
+        >>> await SpamTrapDetector.is_spam_trap("admin@test.lab")
+        {'is_spam_trap': False, 'confidence': 0.0, 'trap_type': 'none', 
+         'source': 'testing_domain_excluded'}
     """
     
     # Dominios conocidos de spam traps (pristine y recycled)
@@ -1928,9 +1966,26 @@ class SpamTrapDetector:
     _cache_ttl = 3600  # 1 hora
     
     @classmethod
-    async def is_spam_trap(cls, email: str) -> Dict[str, Any]:
+    async def is_spam_trap(cls, email: str, testing_mode: bool = False) -> Dict[str, Any]:
         """
         Detecta si un email es un spam trap con scoring contextual.
+        
+        Args:
+            email: Email address to check
+            testing_mode: If True, excludes special-use TLDs (.test, .localhost, etc.)
+        
+        Returns:
+            Dict con:
+            - is_spam_trap (bool): True si es spam trap
+            - confidence (float): 0.0-1.0, confianza de la detección
+            - trap_type (str): pristine|recycled|typo|role_abuse|suspicious_domain|none
+            - source (str): internal_list|typo_list|role_pattern|pattern_match|excluded
+            - details (str): Explicación detallada
+        
+        Notas:
+            - Dominios de testing (.test.lab, .localhost, etc.) son excluidos
+            - Cache interno para optimizar consultas repetidas
+            - Scoring contextual basado en riesgo del dominio
         """
         email_lower = email.lower().strip()
         
@@ -1947,46 +2002,102 @@ class SpamTrapDetector:
             result = {
                 "is_spam_trap": False,
                 "confidence": 0.0,
-                "trap_type": "unknown",
+                "trap_type": "none",
                 "source": "invalid_format",
-                "details": "Invalid email format"
+                "details": "Invalid email format - no @ separator found"
             }
             cls._save_to_cache(email_lower, result)
             return result
         
-        # 1. Verificar dominios conocidos de spam traps
+        # ================================================================
+        # 🆕 EXCLUSIÓN DE DOMINIOS DE TESTING
+        # ================================================================
+        # Lista exhaustiva de TLDs y sufijos de testing
+        TESTING_DOMAIN_SUFFIXES = (
+            '.test.lab',      # Testing interno
+            '.localhost',     # Localhost
+            '.local',         # Dominio local
+            '.test',          # RFC 2606 special-use TLD
+            '.example.com',   # RFC 2606 documentation domain
+            '.example.net',   # RFC 2606 documentation domain
+            '.example.org',   # RFC 2606 documentation domain
+            '.invalid',       # RFC 2606 special-use TLD
+            '.test.com',      # Testing común
+            '.dev.local',     # Desarrollo local
+            '.stage.local',   # Staging local
+        )
+        
+        # ✅ NUEVO: Verificar si es testing_mode para exclusiones más agresivas
+        if testing_mode:
+            # En testing mode, excluir TODOS los dominios de testing
+            if any(domain.endswith(suffix) for suffix in TESTING_DOMAIN_SUFFIXES):
+                result = {
+                    "is_spam_trap": False,
+                    "confidence": 0.0,
+                    "trap_type": "none",
+                    "source": "testing_domain_excluded",
+                    "details": f"Testing domain excluded from spam trap checks: {domain}"
+                }
+                cls._save_to_cache(email_lower, result)
+                logger.debug(f"Spam trap check skipped for testing domain: {email_lower}")
+                return result
+        else:
+            # En producción, solo excluir dominios locales obvios
+            PRODUCTION_EXCLUSIONS = ('.test.lab', '.localhost', '.local', '.dev.local', '.stage.local')
+            if any(domain.endswith(suffix) for suffix in PRODUCTION_EXCLUSIONS):
+                result = {
+                    "is_spam_trap": False,
+                    "confidence": 0.0,
+                    "trap_type": "none",
+                    "source": "testing_domain_excluded",
+                    "details": f"Local/testing domain excluded from spam trap checks: {domain}"
+                }
+                cls._save_to_cache(email_lower, result)
+                logger.debug(f"Spam trap check skipped for local domain: {email_lower}")
+                return result
+        
+        # ================================================================
+        # 1. VERIFICAR DOMINIOS CONOCIDOS DE SPAM TRAPS
+        # ================================================================
         if domain in cls.KNOWN_SPAM_TRAP_DOMAINS:
+            trap_type = "pristine" if any(keyword in domain for keyword in ["honeypot", "trap", "spamtrap"]) else "recycled"
+            
             result = {
                 "is_spam_trap": True,
                 "confidence": 1.0,
-                "trap_type": "pristine" if "honeypot" in domain or "trap" in domain else "recycled",
+                "trap_type": trap_type,
                 "source": "internal_list",
-                "details": f"Domain {domain} is a known spam trap"
+                "details": f"Domain {domain} is a known spam trap ({trap_type})"
             }
             cls._save_to_cache(email_lower, result)
-            logger.warning(f"Spam trap detected (known domain): {email_lower}")
+            logger.warning(f"[SPAM TRAP] Known domain detected: {email_lower} | Type: {trap_type}")
             return result
         
-        # 2. Verificar typo traps
+        # ================================================================
+        # 2. VERIFICAR TYPO TRAPS (dominios con typos comunes)
+        # ================================================================
         if domain in cls.TYPO_TRAP_DOMAINS:
             result = {
                 "is_spam_trap": True,
                 "confidence": 0.9,
                 "trap_type": "typo",
                 "source": "typo_list",
-                "details": f"Domain {domain} is a common typo trap"
+                "details": f"Domain {domain} is a common typo trap (e.g., gmial.com, yahooo.com)"
             }
             cls._save_to_cache(email_lower, result)
-            logger.warning(f"Typo trap detected: {email_lower}")
+            logger.warning(f"[SPAM TRAP] Typo trap detected: {email_lower}")
             return result
         
-        # 3. Verificar role-based patterns con scoring contextual
+        # ================================================================
+        # 3. VERIFICAR ROLE-BASED PATTERNS CON SCORING CONTEXTUAL
+        # ================================================================
         is_legitimate_provider = domain in cls.LEGITIMATE_PROVIDERS
         is_suspicious_domain = cls._is_suspicious_domain(domain)
         
         risk_level = None
         matched_pattern = None
         
+        # Buscar patrón de riesgo más alto primero
         for pattern in cls.HIGH_RISK_ROLE_PATTERNS:
             if pattern in local_part:
                 risk_level = "high"
@@ -2014,6 +2125,8 @@ class SpamTrapDetector:
                 is_suspicious_domain
             )
             
+            provider_label = "legitimate" if is_legitimate_provider else "unknown"
+            
             result = {
                 "is_spam_trap": is_trap,
                 "confidence": confidence,
@@ -2021,21 +2134,29 @@ class SpamTrapDetector:
                 "source": "role_pattern",
                 "details": (
                     f"Role-based pattern '{matched_pattern}' detected "
-                    f"(risk: {risk_level}, provider: "
-                    f"{'legitimate' if is_legitimate_provider else 'unknown'})"
+                    f"(risk: {risk_level}, provider: {provider_label}, "
+                    f"suspicious: {is_suspicious_domain})"
                 )
             }
             cls._save_to_cache(email_lower, result)
             
             if is_trap:
                 logger.warning(
-                    f"Role-based trap detected: {email_lower} | "
-                    f"Pattern: {matched_pattern} | Confidence: {confidence}"
+                    f"[SPAM TRAP] Role-based trap: {email_lower} | "
+                    f"Pattern: '{matched_pattern}' | Risk: {risk_level} | "
+                    f"Confidence: {confidence:.2f}"
+                )
+            else:
+                logger.debug(
+                    f"Role pattern detected (not trap): {email_lower} | "
+                    f"Pattern: '{matched_pattern}' | Confidence: {confidence:.2f}"
                 )
             
             return result
         
-        # 4. Verificar patrones sospechosos en el dominio
+        # ================================================================
+        # 4. VERIFICAR PATRONES SOSPECHOSOS EN EL DOMINIO
+        # ================================================================
         suspicious_score = cls._calculate_domain_suspicion(domain)
         
         if suspicious_score >= 0.7:
@@ -2044,22 +2165,30 @@ class SpamTrapDetector:
                 "confidence": suspicious_score,
                 "trap_type": "suspicious_domain",
                 "source": "pattern_match",
-                "details": f"Domain {domain} shows suspicious patterns"
+                "details": f"Domain {domain} shows suspicious patterns (score: {suspicious_score:.2f})"
             }
             cls._save_to_cache(email_lower, result)
-            logger.warning(f"Suspicious domain detected: {email_lower} (score: {suspicious_score})")
+            logger.warning(
+                f"[SPAM TRAP] Suspicious domain: {email_lower} | "
+                f"Score: {suspicious_score:.2f}"
+            )
             return result
         
-        # No es spam trap
+        # ================================================================
+        # 5. NO ES SPAM TRAP - EMAIL LIMPIO
+        # ================================================================
         result = {
             "is_spam_trap": False,
             "confidence": 0.0,
-            "trap_type": "unknown",
+            "trap_type": "none",
             "source": "no_match",
             "details": "No spam trap indicators found"
         }
         cls._save_to_cache(email_lower, result)
+        logger.debug(f"Spam trap check passed: {email_lower}")
         return result
+
+
     
     @classmethod
     def _calculate_role_pattern_score(
@@ -2202,6 +2331,46 @@ class RiskScorer:
     WEIGHT_ROLE_BASED = 15
     WEIGHT_CATCH_ALL = 12
     WEIGHT_TOXIC_DOMAIN = 30
+
+    SPECIAL_USE_TLDS = {'.test', '.example', '.invalid', '.localhost'}
+
+    ROLE_EMAIL_WEIGHTS = {
+        # High-risk roles
+        'abuse': 25, 'postmaster': 20, 'webmaster': 20, 'admin': 15,
+        'spam': 25, 'nobody': 20, 'trap': 25, 'honeypot': 25,
+        # Medium-risk
+        'support': 10, 'help': 10, 'contact': 10, 'info': 8, 'hello': 8,
+        # Low-risk
+        'newsletter': 5, 'notifications': 5, 'alerts': 5, 'team': 3
+    }
+
+    @classmethod
+    def _is_testing_mode_allowed(cls, validation_result: Dict[str, Any]) -> bool:
+        """Check if testing mode allows special TLDs."""
+        return validation_result.get('testing_mode', False)
+
+    @classmethod
+    def _should_allow_special_tld(cls, email: str, validation_result: Dict[str, Any]) -> bool:
+        """Check if special TLDs should be allowed."""
+        if not email or '@' not in email:
+            return False
+        domain = email.split('@')[-1].lower()
+        is_special_tld = any(domain.endswith(tld) for tld in cls.SPECIAL_USE_TLDS)
+        return is_special_tld and cls._is_testing_mode_allowed(validation_result)
+
+    @classmethod
+    def _get_role_email_weight(cls, local_part: str) -> int:
+        """Get risk weight for role-based email addresses."""
+        for role, weight in cls.ROLE_EMAIL_WEIGHTS.items():
+            if role in local_part.lower():
+                return weight
+        return 0
+
+    @classmethod
+    def _is_special_use_tld(cls, email: str) -> bool:
+        """Check if email has a special-use TLD."""
+        domain = email.split('@')[-1].lower()
+        return any(domain.endswith(tld) for tld in cls.SPECIAL_USE_TLDS)
     
     @classmethod
     def calculate_risk(
@@ -2214,6 +2383,23 @@ class RiskScorer:
         score = 0
         factors: Dict[str, int] = {}
         confidence_values: List[float] = []
+        
+        # Special TLD handling
+        email = validation_result.get('email', '')
+        if email and cls._is_special_use_tld(email):
+            if not cls._is_testing_mode_allowed(validation_result):
+                return RiskAssessment(
+                    score=100,
+                    level='critical',
+                    factors={'special_use_tld': 100},
+                    explanation="Special-use TLD not allowed in production",
+                    confidence=1.0
+                )
+            else:
+                # En modo testing, permitir pero marcar con riesgo bajo
+                factors['special_use_tld'] = 5
+                score += 5
+                confidence_values.append(0.8)
         
         # 1. Spam trap (highest priority)
         if spam_trap_result and spam_trap_result.get('is_spam_trap'):
@@ -2229,8 +2415,19 @@ class RiskScorer:
             score += cls.WEIGHT_INVALID_SYNTAX
             confidence_values.append(1.0)
         
-        # 3. SMTP check failed
-        if not validation_result.get('smtp_checked', True):
+        # 3. SMTP check status
+        if validation_result.get('is_restricted', False):
+            # Known providers like Gmail/Yahoo
+            factors['smtp_restricted'] = 5
+            score += 5
+            confidence_values.append(0.9)
+        elif validation_result.get('smtp_skipped', False):
+            # Other skipped cases
+            factors['smtp_skipped'] = 10
+            score += 10
+            confidence_values.append(0.8)
+        elif not validation_result.get('smtp_checked', True):
+            # Actual SMTP failure
             factors['smtp_failed'] = cls.WEIGHT_SMTP_FAILED
             score += cls.WEIGHT_SMTP_FAILED
             confidence_values.append(0.85)
@@ -2253,11 +2450,14 @@ class RiskScorer:
                 score += cls.WEIGHT_BREACH
                 confidence_values.append(1.0)
         
-        # 6. Role-based email
+        # 6. Role-based email (updated)
         if validation_result.get('role_based', False):
-            factors['role_based'] = cls.WEIGHT_ROLE_BASED
-            score += cls.WEIGHT_ROLE_BASED
-            confidence_values.append(0.9)
+            local_part = email.split('@')[0] if '@' in email else ''
+            role_weight = cls._get_role_email_weight(local_part)
+            if role_weight > 0:
+                factors['role_based'] = role_weight
+                score += role_weight
+                confidence_values.append(0.9)
         
         # 7. Catch-all domain
         if validation_result.get('catch_all', False):

@@ -98,6 +98,7 @@ class EmailValidationRequest(BaseAPIModel):
                     "check_smtp": True,
                     "include_raw_dns": False,
                     "priority": "standard",
+                    "testing_mode": False
                 }
             ]
         }
@@ -107,9 +108,23 @@ class EmailValidationRequest(BaseAPIModel):
         ...,
         description="Email address to validate (RFC 5321 compliant)"
     )
-    check_smtp: bool = Field(default=False, description="Enable SMTP mailbox verification")
-    include_raw_dns: bool = Field(default=False, description="Include raw DNS records")
-    
+    check_smtp: bool = Field(
+        default=False, 
+        description="Enable SMTP mailbox verification"
+    )
+    include_raw_dns: bool = Field(
+        default=False, 
+        description="Include raw DNS records"
+    )
+    testing_mode: bool = Field(
+        default=False,
+        description="Enable testing mode (allows special TLDs like .test, .example, etc.)",
+    )
+    priority: PriorityEnum = Field(
+        default=PriorityEnum.standard,
+        description="Validation priority level",
+    )
+
     @field_validator('email')
     def validate_email_format(cls, v):
         """
@@ -123,10 +138,6 @@ class EmailValidationRequest(BaseAPIModel):
         """
         from app.security.input_validation import validate_email_strict
         return validate_email_strict(v)
-    priority: PriorityEnum = Field(
-        default=PriorityEnum.standard,
-        description="Validation priority level",
-    )
 
     @field_validator("email", mode="before")
     @classmethod

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, Deque, List, Optional, Set, Tuple
 from collections import defaultdict, deque
+from app.redis_client import REDIS_CLIENT
 
 import aiodns
 import dns.resolver
@@ -203,9 +204,6 @@ mx_cache = AsyncTTLCache(ttl=config.mx_cache_ttl, maxsize=config.mx_cache_maxsiz
 domain_cache = AsyncTTLCache(ttl=3600, maxsize=1000)
 smtp_cache = AsyncTTLCache(ttl=300, maxsize=1000)
 
-REDIS_CLIENT: Optional["RedisT"] = None
-
-
 def set_redis_client(redis_client: "RedisT") -> None:
     """
     Inyecta el cliente Redis opcional para cache distribuida.
@@ -298,10 +296,14 @@ SMTP_RESTRICTED_DOMAINS: Set[str] = {
     "bellsouth.net",
 }
 
-RESERVED_DOMAINS: Set[str] = {
-    "example.com", "example.org", "example.net", "example.test",
-    "invalid.com", "test.com", "test.org",
-}
+#
+# Reserved domains (documentación / ejemplos): solo los tres definidos por IANA/RFC.
+# Nota: NO incluir "test.org"/"invalid.com": son dominios reales potencialmente válidos.
+#
+RESERVED_DOMAINS: Set[str] = {"example.com", "example.net", "example.org"}
+
+# Special-use TLDs (no deberían aceptarse como deliverable en producción).
+SPECIAL_USE_TLDS: Set[str] = {".test", ".example", ".invalid", ".localhost"}
 
 COMMON_DISPOSABLE: Set[str] = {
     "tempmail.com", "10minutemail.com", "guerrillamail.com",
@@ -500,58 +502,91 @@ class DNSResolver:
     def __init__(self) -> None:
         timeout = float(getattr(settings.validation, "mx_lookup_timeout", 2.0))
         
-        # ✅ Obtener nameservers con fallback a DNS públicos
-        ns = getattr(settings.validation, "dns_nameservers", None)
-        if not ns:
-            env_ns = os.getenv("DNS_NAMESERVERS", "").strip()
-            if env_ns:
-                ns = [x.strip() for x in env_ns.split(",") if x.strip()]
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # OBTENER NAMESERVERS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Orden de prioridad:
+        # 1. Variable de entorno DNS_NAMESERVERS (directo, sin prefijo)
+        # 2. settings.validation.dns_nameservers
+        # 3. Fallback a DNS públicos
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
-        # ✅ CRÍTICO: Fallback a DNS públicos si no hay configuración
+        ns = None
+        
+        # 🔹 PRIORIDAD 1: Leer de ENV directamente
+        env_ns = os.getenv("DNS_NAMESERVERS", "").strip()
+        if env_ns:
+            ns = [x.strip() for x in env_ns.split(",") if x.strip()]
+            logger.info(f"Using DNS nameservers from ENV (DNS_NAMESERVERS): {ns}")
+        
+        # 🔹 PRIORIDAD 2: Leer de settings
+        if not ns:
+            settings_ns = getattr(settings.validation, "dns_nameservers", None)
+            if settings_ns and isinstance(settings_ns, list) and len(settings_ns) > 0:
+                ns = settings_ns
+                logger.info(f"Using DNS nameservers from settings.validation: {ns}")
+        
+        # 🔹 PRIORIDAD 3: Fallback a DNS públicos
         if not ns:
             ns = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
-            logger.info(f"No DNS nameservers configured, using public DNS: {ns}")
-        else:
-            logger.info(f"Using custom nameservers: {ns}")
+            logger.warning(
+                f"No DNS nameservers configured in ENV or settings | "
+                f"Falling back to public DNS: {ns}"
+            )
         
-        # ✅ SIEMPRE configurar nameservers (incluso con fallback)
-        self._sync_resolver = dns.resolver.Resolver(configure=False)  # ← configure=False para control manual
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # CONFIGURAR RESOLVERS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        # Sync resolver (dnspython)
+        self._sync_resolver = dns.resolver.Resolver(configure=False)
         self._sync_resolver.nameservers = ns
         self._sync_resolver.timeout = timeout
-        self._sync_resolver.lifetime = max(timeout * 5.0, 10.0)  # ← AUMENTAR de 2.0 a 5.0
+        self._sync_resolver.lifetime = max(timeout * 5.0, 10.0)
         
-        # ✅ SIEMPRE pasar nameservers a aiodns
+        # Async resolver (aiodns)
         self._async_resolver = aiodns.DNSResolver(
             timeout=timeout,
             nameservers=ns
         )
-
-    # Alias esperados por tests
-    async def _query_mx_primary(self, domain: str) -> List["MXRecord"]:
-        return await self._async_query_mx_primary(domain)
-
-    async def _query_mx_fallback(self, domain: str) -> List["MXRecord"]:
-        return await self._async_query_mx_fallback(domain)
-
-    # -------- MX (implementación real) --------
-    async def _async_query_mx_primary(self, domain: str) -> List["MXRecord"]:
-        answers = await self._async_resolver.query(domain, "MX")
-        records: List["MXRecord"] = []
-        for answer in answers or []:
-            records.append(MXRecord(exchange=answer.host, preference=int(answer.priority)))
-        return sorted(records, key=lambda x: x.preference)
-
-    async def _async_query_mx_fallback(self, domain: str) -> List["MXRecord"]:
-        loop = asyncio.get_running_loop()
-        def sync_resolve() -> List["MXRecord"]:
-            rs = list(self._sync_resolver.resolve(domain, "MX"))
-            out: List["MXRecord"] = []
-            for r in rs:
-                out.append(MXRecord(exchange=str(r.exchange).rstrip("."), preference=int(r.preference)))
-            return sorted(out, key=lambda x: x.preference)
-        return await loop.run_in_executor(None, sync_resolve)
-
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # LOG DE CONFIGURACIÓN FINAL
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        logger.info(
+            f"DNSResolver initialized | "
+            f"nameservers={ns} | "
+            f"timeout={timeout}s | "
+            f"lifetime={self._sync_resolver.lifetime}s"
+        )
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PUBLIC API - MÉTODOS PRINCIPALES
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    async def resolve_mx(self, domain: str) -> list["MXRecord"]:
+        """
+        Alias para query_mx_async (compatibilidad con código antiguo).
+        
+        Args:
+            domain: Dominio a consultar
+            
+        Returns:
+            Lista de MXRecord ordenados por preferencia
+        """
+        return await self.query_mx_async(domain)
+    
     async def query_mx_async(self, domain: str) -> list["MXRecord"]:
+        """
+        Consulta registros MX de forma asíncrona.
+        
+        Args:
+            domain: Dominio a consultar
+            
+        Returns:
+            Lista de MXRecord ordenados por preferencia
+        """
         # Usar los alias que los tests parchean
         try:
             recs = await async_retry(self._query_mx_primary, domain)
@@ -589,10 +624,68 @@ class DNSResolver:
         return sorted(out, key=lambda x: x.preference)
 
     async def query_mx_with_pref(self, domain: str) -> list[tuple[int, str]]:
+        """
+        Consulta registros MX y devuelve tuplas (preferencia, host).
+        
+        Args:
+            domain: Dominio a consultar
+            
+        Returns:
+            Lista de tuplas (preferencia, exchange)
+        """
         mx_records = await self.query_mx_async(domain)
         if mx_records and not hasattr(mx_records[0], "preference"):
             return [(int(p), str(h)) for p, h in mx_records]  # type: ignore[index]
         return [(r.preference, r.exchange) for r in mx_records]  # type: ignore[union-attr]
+    
+    async def query_txt(self, name: str) -> list[str]:
+        """
+        Consulta registros TXT.
+        
+        Args:
+            name: Nombre a consultar (ej: _dmarc.example.com)
+            
+        Returns:
+            Lista de strings con los registros TXT
+        """
+        try:
+            return await async_retry(self._async_query_txt_primary, name)
+        except Exception as e:
+            logger.debug(f"Async TXT primary failed for {name}: {str(e)}")
+        try:
+            return await async_retry(self._async_query_txt_fallback, name)
+        except Exception as e2:
+            logger.debug(f"Fallback TXT query failed for {name}: {str(e2)}")
+            return []
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # INTERNAL/PRIVATE METHODS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    # Alias esperados por tests
+    async def _query_mx_primary(self, domain: str) -> List["MXRecord"]:
+        return await self._async_query_mx_primary(domain)
+
+    async def _query_mx_fallback(self, domain: str) -> List["MXRecord"]:
+        return await self._async_query_mx_fallback(domain)
+
+    # -------- MX (implementación real) --------
+    async def _async_query_mx_primary(self, domain: str) -> List["MXRecord"]:
+        answers = await self._async_resolver.query(domain, "MX")
+        records: List["MXRecord"] = []
+        for answer in answers or []:
+            records.append(MXRecord(exchange=answer.host, preference=int(answer.priority)))
+        return sorted(records, key=lambda x: x.preference)
+
+    async def _async_query_mx_fallback(self, domain: str) -> List["MXRecord"]:
+        loop = asyncio.get_running_loop()
+        def sync_resolve() -> List["MXRecord"]:
+            rs = list(self._sync_resolver.resolve(domain, "MX"))
+            out: List["MXRecord"] = []
+            for r in rs:
+                out.append(MXRecord(exchange=str(r.exchange).rstrip("."), preference=int(r.preference)))
+            return sorted(out, key=lambda x: x.preference)
+        return await loop.run_in_executor(None, sync_resolve)
 
     # -------- TXT --------
     async def _async_query_txt_primary(self, name: str) -> list[str]:
@@ -625,18 +718,10 @@ class DNSResolver:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, sync_txt)
 
-    async def query_txt(self, name: str) -> list[str]:
-        try:
-            return await async_retry(self._async_query_txt_primary, name)
-        except Exception as e:
-            logger.debug(f"Async TXT primary failed for {name}: {str(e)}")
-        try:
-            return await async_retry(self._async_query_txt_fallback, name)
-        except Exception as e2:
-            logger.debug(f"Fallback TXT query failed for {name}: {str(e2)}")
-            return []
 
+# Singleton global
 dns_resolver = DNSResolver()
+
 
 # Nuevo contrato estable público: siempre devuelve list[str]
 async def get_mx_hosts(domain: str, max_records: int = 5) -> list[str]:
@@ -670,9 +755,21 @@ async def _cache_mx_hosts(domain: str, hosts: list[str], ttl: int | None = None)
 # Resolución IP pública
 # ---------------------------
 
-async def resolve_public_ip(hostname: str, prefer_ipv4: bool = True) -> Optional[str]:
+async def resolve_public_ip(
+    hostname: str, 
+    prefer_ipv4: bool = True,
+    allow_private: bool = False  # ✅ NUEVO: Permitir IPs privadas en testing
+) -> Optional[str]:
     """
     Obtiene una IP pública (no privada/loopback/etc.) para un hostname.
+    
+    Args:
+        hostname: Hostname a resolver
+        prefer_ipv4: Preferir IPv4 sobre IPv6
+        allow_private: Si True, acepta IPs privadas (para testing con Docker)
+        
+    Returns:
+        IP pública (o privada si allow_private=True), o None si no se encuentra
     """
     try:
         loop = asyncio.get_running_loop()
@@ -684,34 +781,67 @@ async def resolve_public_ip(hostname: str, prefer_ipv4: bool = True) -> Optional
             proto=0,
             flags=socket.AI_ADDRCONFIG,
         )
+        
         v4: List[str] = []
         v6: List[str] = []
+        
         for family, _, _, _, sockaddr in addrinfo:
             ip = sockaddr[0]
             try:
                 ip_obj = ipaddress.ip_address(ip)
+                
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # VALIDACIÓN DE IP
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                
+                # Siempre rechazar estas
                 if (
-                    ip_obj.is_private
-                    or ip_obj.is_loopback
+                    ip_obj.is_loopback
                     or ip_obj.is_link_local
                     or ip_obj.is_multicast
                     or ip_obj.is_reserved
                     or ip_obj.is_unspecified
                 ):
                     continue
-                if family == socket.AF_INET:
-                    v4.append(ip)
-                elif family == socket.AF_INET6:
-                    v6.append(ip)
+                
+                # ✅ NUEVO: En testing_mode, aceptar IPs privadas
+                if allow_private:
+                    # Aceptar cualquier IP (excepto las de arriba)
+                    if family == socket.AF_INET:
+                        v4.append(ip)
+                    elif family == socket.AF_INET6:
+                        v6.append(ip)
+                else:
+                    # Modo normal: solo IPs públicas
+                    if not ip_obj.is_private:
+                        if family == socket.AF_INET:
+                            v4.append(ip)
+                        elif family == socket.AF_INET6:
+                            v6.append(ip)
+                
             except Exception:
                 continue
+        
+        # Retornar según preferencia
         if prefer_ipv4:
-            return (v4 or v6 or [None])[0]
+            result = (v4 or v6 or [None])[0]
         else:
-            return (v6 or v4 or [None])[0]
+            result = (v6 or v4 or [None])[0]
+        
+        # ✅ Log para debugging
+        if result and allow_private:
+            logger.debug(f"Resolved {hostname} to {result} (allow_private=True)")
+        elif result:
+            logger.debug(f"Resolved {hostname} to public IP {result}")
+        else:
+            logger.debug(f"No {'valid' if not allow_private else 'public'} IP found for {hostname}")
+        
+        return result
+        
     except Exception as e:
-        logger.debug("Failed to resolve public IP for %s: %s", hostname, str(e))
+        logger.debug(f"Failed to resolve IP for {hostname}: {str(e)}")
         return None
+
 
 # ---------------------------
 # MX records con caché
@@ -829,7 +959,7 @@ class DomainChecker:
     def __init__(self) -> None:
         self.connection_timeout = min(config.smtp_timeout, 15.0)
 
-    async def check_domain_async(self, domain: str) -> VerificationResult:
+    async def check_domain_async(self, domain: str, testing_mode: bool = False) -> VerificationResult:
         """
         ✅ Verifica configuración básica de un dominio para recepción SMTP.
 
@@ -838,21 +968,45 @@ class DomainChecker:
         - Si no hay MX records → valid: false (dominio inválido)
         - En Docker, MX exists es suficiente para considerar valid: true
         - Detecta dominios reservados, de abuso y descartables antes de tocar MX/DNS.
+        
+        Returns:
+            VerificationResult con valid, detail, error_type, mx_host
         """
-
+        domain = domain.lower().strip()
+        logger.info(f"Starting domain validation for: {domain}")
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 1. VALIDACIONES DE FORMATO Y POLÍTICAS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
         # Validación de formato
         if not domain_validator.is_valid_domain_format(domain):
-            return VerificationResult(False, "Invalid domain format", error_type="invalid_format")
+            return VerificationResult(
+                False, 
+                "Invalid domain format", 
+                error_type="invalid_format"
+            )
 
         base = domain_extractor.extract_base_domain(domain)
 
+        # Política única: en producción bloquear special-use TLDs (salvo testing_mode)
+        if not testing_mode and is_special_use_tld(domain):
+            return VerificationResult(
+                False,
+                f"Special-use TLD not allowed in production: {domain}",
+                error_type="invalid_domain",
+            )
+
         # En PRODUCCIÓN: bloquear dominios reservados
         if base in RESERVED_DOMAINS:
-            if not getattr(settings, "testing_mode", False):
-                return VerificationResult(False, "Reserved domain", error_type="reserved_domain")
+            if not testing_mode:
+                return VerificationResult(
+                    False, 
+                    f"Reserved domain: {base}", 
+                    error_type="reserved_domain"
+                )
 
-        # 🔹 NUEVO: dominios de abuso conocidos (ABUSE_DOMAINS)
-        # Se comprueba sobre el base domain para que ej. sub.spam-sender.net también caiga.
+        # Dominios de abuso conocidos
         if is_abuse_domain(base):
             return VerificationResult(
                 False,
@@ -869,79 +1023,251 @@ class DomainChecker:
                 error_type="disposable_domain"
             )
 
-        # ✅ Obtener MX records
-        mx_records = await get_mx_records(domain)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 2. OBTENER MX RECORDS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # ✅ Instanciar circuit breaker para SMTP
+        smtp_circuit_breaker = PerHostCircuitBreaker(
+            service_name="smtp",
+            redis_client=REDIS_CLIENT,
+            fail_max=5,
+            timeout_duration=60
+        )
+
+        # Inicializar variables
+        mx_records = []
+        last_error = None
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # DEBUG: Log de estado antes de query
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        logger.info(
+            f"[MX-DEBUG] Starting MX query | "
+            f"domain={domain} | "
+            f"nameservers={dns_resolver._sync_resolver.nameservers} | "
+            f"timeout={dns_resolver._sync_resolver.timeout}s"
+        )
+
+        try:
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # QUERY MX RECORDS
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            mx_records = await dns_resolver.resolve_mx(domain)
+            
+            logger.info(
+                f"[MX-DEBUG] ✅ MX query SUCCESS | "
+                f"domain={domain} | "
+                f"found={len(mx_records)} records"
+            )
+            
+            # Log cada MX record
+            for i, mx in enumerate(mx_records, 1):
+                preference = getattr(mx, 'preference', 0)
+                exchange = getattr(mx, 'exchange', str(mx))
+                logger.info(f"[MX-DEBUG]    [{i}] MX {preference} {exchange}")
+
+        except dns.resolver.NXDOMAIN as e:
+            logger.warning(
+                f"[MX-DEBUG] ❌ NXDOMAIN | "
+                f"domain={domain} | "
+                f"error={e}"
+            )
+            return VerificationResult(
+                False,
+                f"Domain {domain} does not exist",
+                error_type="no_dns_records",
+            )
+
+        except dns.resolver.NoAnswer as e:
+            logger.info(
+                f"[MX-DEBUG] ⚠️  NoAnswer | "
+                f"domain={domain} | "
+                f"error={e}"
+            )
+            mx_records = []  # ✅ Asegurar que está vacío
+
+        except Exception as e:
+            logger.error(
+                f"[MX-DEBUG] ❌ EXCEPTION | "
+                f"domain={domain} | "
+                f"type={type(e).__name__} | "
+                f"error={e}",
+                exc_info=True
+            )
+            mx_records = []  # ✅ Asegurar que está vacío
+            last_error = str(e)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # DEBUG: Log de estado después de query
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        logger.info(
+            f"[MX-DEBUG] After MX query | "
+            f"domain={domain} | "
+            f"mx_records_count={len(mx_records) if mx_records else 0} | "
+            f"last_error={last_error}"
+        )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 3. FALLBACK: A RECORD SI NO HAY MX
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
         if not mx_records:
-            # ❌ Sin MX records = dominio no válido, pero intenta A para distinguir
+            logger.info(f"[MX-DEBUG] No MX records found for {domain}, trying A record fallback")
+            
+            # ✅ Intentar A record como fallback (RFC 5321)
             try:
                 loop = asyncio.get_running_loop()
-
+                
                 def sync_a():
-                    return dns_resolver.sync_resolver.resolve(domain, "A")
-
-                await loop.run_in_executor(None, sync_a)
-                return VerificationResult(
-                    True,  # ← A record existe, puede recibir email
-                    f"{domain} has A record but no MX",
-                    error_type="no_mx_has_a",
-                    mx_host=domain,  # Usar dominio como MX
-                )
-            except Exception:
+                    return dns_resolver._sync_resolver.resolve(domain, "A")
+                
+                a_records = await loop.run_in_executor(None, sync_a)
+                
+                if a_records:
+                    logger.info(f"[MX-DEBUG] ✅ Domain {domain} has A record but no MX (RFC 5321 fallback)")
+                    
+                    # ✅ RETORNAR: valid=True pero con error_type
+                    return VerificationResult(
+                        True,  # valid=True (dominio existe según RFC 5321)
+                        f"{domain} has A record but no MX",
+                        error_type="no_mx_has_a",  # ✅ DEBE estar presente
+                        mx_host=domain,  # Usar dominio como MX fallback
+                    )
+            
+            except dns.resolver.NXDOMAIN:
+                logger.error(f"[MX-DEBUG] ❌ Domain {domain} has no MX or A records (NXDOMAIN)")
                 return VerificationResult(
                     False,
-                    "No MX or A records for domain",
+                    f"Domain {domain} does not exist",
+                    error_type="no_dns_records",
+                )
+            
+            except Exception as e:
+                logger.error(f"[MX-DEBUG] ❌ Failed to resolve A record for {domain}: {e}")
+                return VerificationResult(
+                    False,
+                    f"No MX or A records for domain: {last_error or str(e)}",
                     error_type="no_dns_records",
                 )
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 4. VERIFICAR SEGURIDAD Y CONECTIVIDAD DE MX HOSTS
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        logger.info(f"[MX-DEBUG] Starting MX host verification for {len(mx_records)} records")
+        
         # ✅ MX records existen = dominio válido
         # Ahora intento de conexión SMTP (pero si falla, no invalida el email)
         connection_succeeded = False
-        last_error = None
+        all_mx_unsafe = True
+        first_unsafe_mx = None
+        
+        for i, mx in enumerate(mx_records, 1):
+            mx_host = str(mx.exchange) if hasattr(mx, "exchange") else str(mx)
+            mx_host = mx_host.rstrip('.')  # Remover punto final si existe
+            
+            logger.info(f"[MX-DEBUG] [{i}/{len(mx_records)}] Checking MX host: {mx_host}")
 
-        for mx in mx_records:
-            mx_host = mx.exchange if hasattr(mx, "exchange") else str(mx)
-
-            if await smtp_circuit_breaker.is_open(mx_host):
-                logger.info("Circuit breaker open for %s", mx_host)
-                last_error = "Circuit breaker open"
-                continue
-
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 4.1. VERIFICAR SI EL MX ES SEGURO
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if not domain_validator.is_safe_mx_host(mx_host):
-                logger.warning("Unsafe MX host: %s", mx_host)
-                await smtp_circuit_breaker.record_failure(mx_host)
-                last_error = "Unsafe MX host"
-                continue
+                logger.warning(f"[MX-DEBUG] ⚠️  Unsafe MX host detected: {mx_host} (localhost/private IP)")
+                
+                if first_unsafe_mx is None:
+                    first_unsafe_mx = mx_host
+                
+                # Si no es el último MX, marcar fallo y continuar con el siguiente
+                if i < len(mx_records):
+                    await smtp_circuit_breaker.record_failure(mx_host)
+                    last_error = "Unsafe MX host"
+                    continue
+                
+                # ✅ Si es el ÚLTIMO MX y todos son unsafe, retornar error
+                if all_mx_unsafe:
+                    logger.error(f"[MX-DEBUG] ❌ All MX hosts for {domain} are unsafe")
+                    return VerificationResult(
+                        True,  # valid=True (MX existe, solo es inseguro)
+                        f"Domain has MX but all point to unsafe hosts (localhost/private IPs)",
+                        error_type="unsafe_mx_host",  # ✅ DEBE estar presente
+                        mx_host=first_unsafe_mx or mx_host,
+                    )
+            else:
+                # Al menos un MX es seguro
+                all_mx_unsafe = False
+                logger.info(f"[MX-DEBUG] ✅ MX host {mx_host} is safe")
 
-            public_ip = await resolve_public_ip(mx_host, prefer_ipv4=config.prefer_ipv4)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 4.2. RESOLVER IP PÚBLICA
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            # ✅ NUEVO: Pasar testing_mode a allow_private
+            public_ip = await resolve_public_ip(
+                mx_host, 
+                prefer_ipv4=config.prefer_ipv4,
+                allow_private=testing_mode  # ✅ Permitir IPs privadas en testing
+            )
+
             if not public_ip:
-                logger.debug("MX %s has no public IP", mx_host)
+                logger.debug(f"[MX-DEBUG] ⚠️  MX {mx_host} has no public IP")
                 await smtp_circuit_breaker.record_failure(mx_host)
                 last_error = "No public IP"
                 continue
 
+            logger.info(f"[MX-DEBUG] ✅ MX host {mx_host} resolves to {public_ip}")
+
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 4.3. VERIFICAR CIRCUIT BREAKER
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if await smtp_circuit_breaker.is_open(mx_host):
+                logger.warning(f"[MX-DEBUG] ⚠️  Circuit breaker OPEN for {mx_host}, skipping")
+                last_error = "Circuit breaker open"
+                continue
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 4.4. PROBAR CONEXIÓN SMTP
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             connection_result = await self._test_smtp_connection(mx_host)
+            
             if connection_result.success:
-                # ✅ Conexión exitosa
+                # ✅ Conexión exitosa - dominio completamente válido
+                logger.info(f"[MX-DEBUG] ✅ Successfully connected to {mx_host} for {domain}")
+                await smtp_circuit_breaker.record_success(mx_host)
+                
                 return VerificationResult(
                     True,
                     f"Connected to {mx_host}",
+                    error_type=None,  # Sin error
                     mx_host=mx_host,
                 )
             else:
+                # Fallo de conexión, intentar siguiente MX
                 await smtp_circuit_breaker.record_failure(mx_host)
-                logger.debug(f"Connection failed to {mx_host}: {connection_result.message}")
+                logger.debug(f"[MX-DEBUG] ⚠️  Connection failed to {mx_host}: {connection_result.message}")
                 last_error = connection_result.message
-                # Continuar intentando otros MX
+                continue
 
-        # ✅ CAMBIO CLAVE:
-        # MX records existen pero todos fallan conexión.
-        # En Docker es normal (sin acceso a red externa).
-        # Retornar valid: true pero con error_type informativo.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 5. TODOS LOS MX FALLARON CONEXIÓN SMTP
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        # MX records existen pero todas las conexiones SMTP fallaron.
+        # Dominio válido, solo problema de conectividad de red.
+        first_mx = str(mx_records[0].exchange) if hasattr(mx_records[0], "exchange") else str(mx_records[0])
+        first_mx = first_mx.rstrip('.')
+        
+        logger.warning(
+            f"[MX-DEBUG] ⚠️  Domain {domain} has valid MX records but all SMTP connections failed | "
+            f"Last error: {last_error}"
+        )
+        
         return VerificationResult(
-            True,
-            f"Domain {domain} has valid MX records but SMTP connection failed ({last_error})",
-            error_type="mx_connection_failed",
-            mx_host=str(mx_records[0].exchange) if mx_records else domain,
+            True,  # ✅ Dominio válido, solo falló la conexión de red
+            f"Valid domain but SMTP connection unavailable: {last_error}",
+            error_type="smtp_connection_unavailable",
+            mx_host=first_mx,
         )
 
 
@@ -1314,27 +1640,36 @@ async def check_smtp_mailbox_safe(
 # APIs públicas de dominio
 # ---------------------------
 
-async def cached_check_domain(domain: str) -> VerificationResult:
+def is_special_use_tld(domain: str) -> bool:
+    """Verifica si un dominio termina en un TLD de uso especial."""
+    d = (domain or "").strip().lower().rstrip(".")
+    return any(d.endswith(tld) for tld in SPECIAL_USE_TLDS)
+
+
+async def cached_check_domain(domain: str, testing_mode: bool = False) -> VerificationResult:
     norm = domain.strip().lower()
-    cache_key = UnifiedCache.build_key("domain", norm)
+    # Evitar mezclar resultados de testing_mode (cambia la política de bloqueo).
+    # Usar formato de clave compatible con Redis (sin =)
+    testing_suffix = "tm1" if testing_mode else "tm0"
+    cache_key = UnifiedCache.build_key("domain", norm, testing_suffix)
     cached = await async_cache_get(cache_key)
     if isinstance(cached, dict):
         return VerificationResult(**cached)
     if isinstance(cached, VerificationResult):
         return cached
 
-    res_or_await = domain_checker.check_domain_async(norm)
+    res_or_await = domain_checker.check_domain_async(norm, testing_mode=testing_mode)
     result = await res_or_await if inspect.isawaitable(res_or_await) else res_or_await
     await async_cache_set(cache_key, result.to_dict(), ttl=3600)
     return result
 
 
-def check_domain_sync(domain: str) -> VerificationResult:
+def check_domain_sync(domain: str, testing_mode: bool = False) -> VerificationResult:
     try:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(cached_check_domain(domain))
+            return asyncio.run(cached_check_domain(domain, testing_mode=testing_mode))
         else:
             fut = asyncio.run_coroutine_threadsafe(cached_check_domain(domain), loop)
             return fut.result(timeout=30)

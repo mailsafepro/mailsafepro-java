@@ -1,3 +1,5 @@
+from app.pii_mask import mask_email
+
 """
 Fallback Strategies for Critical Services
 

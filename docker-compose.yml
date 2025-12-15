@@ -1,128 +1,200 @@
-networks:
-  monitoring:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16
-
-volumes:
-  prometheus-data:
-  alertmanager-data:
-  redis-data:
-
+# docker-compose.yml (opción B: CoreDNS sin healthcheck + depends_on service_started)
+# Nota: en Compose, depends_on con condition soporta service_started / service_healthy / service_completed_successfully.
 
 services:
+  # Internal DNS server for lab environment
+  coredns:
+    image: coredns/coredns:1.11.1
+    platform: linux/arm64/v8
+    command: -conf /etc/coredns/Corefile
+    volumes:
+      - ./infra/dns/Corefile:/etc/coredns/Corefile:ro
+      - ./infra/dns/zones:/etc/coredns/zones:ro
+    networks:
+      monitoring:
+        ipv4_address: 172.20.0.10
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9153:9153/tcp"
+    restart: unless-stopped
+
+
   redis:
     image: redis:7-alpine
-    ports: [ "6379:6379" ]
+    ports:
+      - "6379:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 30s
       retries: 3
-    networks: [ monitoring ]
-    restart: unless-stopped
+    networks:
+      - monitoring
     dns:
       - 8.8.8.8
-      - 8.8.4.4
+      - 1.1.1.1
+      - 172.20.0.10
+    depends_on:
+      coredns:
+        condition: service_started
+    restart: unless-stopped
+
+
+  # SMTP server for testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    platform: linux/amd64
+    container_name: mailhog
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      monitoring:
+        ipv4_address: 172.20.0.20
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8025/"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 172.20.0.10
+    depends_on:
+      coredns:
+        condition: service_started
+
 
   api:
     build: .
     command: >
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    env_file: [ .env ]
+    env_file:
+      - .env
     environment:
       # ========== DNS CRÍTICO PARA VALIDACIÓN ==========
       - DOCKER_ENV=1
-      - DNS_NAMESERVERS=8.8.8.8,8.8.4.4
-      - DNS_TIMEOUT=5.0
-      - VALIDATION_DNS_TIMEOUT=5.0
+      # ✅ CORREGIDO: DNS públicos primero, luego CoreDNS
+      - DNS_NAMESERVERS=8.8.8.8,1.1.1.1,172.20.0.10
+      - DNS_TIMEOUT=3.0
+      - VALIDATION_DNS_TIMEOUT=3.0
       - RETRY_ATTEMPTS=2
       - RETRY_MAX_BACKOFF=1.0
-      - MAX_VALIDATION_TIME=30.0
+      - MAX_VALIDATION_TIME=25.0
+
       # =========== REDIS PARA CACHING ===========
       - REDIS_URL=redis://redis:6379/0
+
       # =========== LOGGING ===========
       - LOG_LEVEL=DEBUG
+
       # =========== SMTP (OPCIONAL) ===========
       - SMTP_TIMEOUT=10.0
-    ports: [ "8000:8000" ]
+      - SMTP_USE_TLS=False
+      - SMTP_SKIP_TLS_VERIFY=True
+    ports:
+      - "8000:8000"
     volumes:
       - .:/app
     depends_on:
+      coredns:
+        condition: service_started
       redis:
         condition: service_healthy
     restart: unless-stopped
-    networks: [ monitoring ]
+    networks:
+      - monitoring
+    # ✅ CORREGIDO: DNS públicos primero
     dns:
       - 8.8.8.8
-      - 8.8.4.4
+      - 1.1.1.1
+      - 172.20.0.10
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 10s
 
+
   worker:
     build: .
     command: /opt/venv/bin/arq app.worker.WorkerSettings
-    env_file: [ .env ]
+    env_file:
+      - .env
     environment:
       # ========== DNS CRÍTICO PARA VALIDACIÓN ==========
       - DOCKER_ENV=1
-      - DNS_NAMESERVERS=8.8.8.8,8.8.4.4
-      - DNS_TIMEOUT=5.0
-      - VALIDATION_DNS_TIMEOUT=5.0
+      # ✅ CORREGIDO: DNS públicos primero, luego CoreDNS
+      - DNS_NAMESERVERS=8.8.8.8,1.1.1.1,172.20.0.10
+      - DNS_TIMEOUT=3.0
+      - VALIDATION_DNS_TIMEOUT=3.0
       - RETRY_ATTEMPTS=2
       - RETRY_MAX_BACKOFF=1.0
-      - MAX_VALIDATION_TIME=30.0
+      - MAX_VALIDATION_TIME=25.0
+
       # =========== REDIS ===========
       - REDIS_URL=redis://redis:6379/0
+
       # =========== LOGGING ===========
       - LOG_LEVEL=DEBUG
-    # ❌ ELIMINAR puerto 8001 - el worker NO es servidor HTTP
-    # ports: [ "8001:8001" ]
+
+      # =========== SMTP (OPCIONAL) ===========
+      - SMTP_USE_TLS=False
+      - SMTP_SKIP_TLS_VERIFY=True
     volumes:
       - .:/app
     depends_on:
+      coredns:
+        condition: service_started
       redis:
         condition: service_healthy
     restart: unless-stopped
-    networks: [ monitoring ]
+    networks:
+      - monitoring
+    # ✅ CORREGIDO: DNS públicos primero
     dns:
       - 8.8.8.8
-      - 8.8.4.4
-    
-    # ✅ HEALTHCHECK CORREGIDO: Verificar conexión a Redis
+      - 1.1.1.1
+      - 172.20.0.10
     healthcheck:
       test: ["CMD", "python", "-c", "import redis; r=redis.Redis.from_url('redis://redis:6379/0'); r.ping()"]
-      interval: 30s       # Cada 30 segundos (no necesita ser tan frecuente)
-      timeout: 10s        # Timeout generoso
-      retries: 5          # Más reintentos antes de marcar como unhealthy
-      start_period: 60s   # Tiempo inicial para que el worker arranque
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
 
   alertmanager:
     image: prom/alertmanager:latest
-    command: [ "--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager" ]
-    ports: [ "9093:9093" ]
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    ports:
+      - "9093:9093"
     volumes:
       - alertmanager-data:/alertmanager
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     restart: unless-stopped
-    networks: [ monitoring ]
+    networks:
+      - monitoring
     dns:
       - 8.8.8.8
-      - 8.8.4.4
+      - 1.1.1.1
+      - 172.20.0.10
+    depends_on:
+      coredns:
+        condition: service_started
     healthcheck:
-      test: [ "CMD", "wget", "-qO-", "http://localhost:9093/-/ready" ]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9093/-/ready"]
       interval: 10s
       timeout: 5s
       retries: 5
+
 
   prometheus:
     image: prom/prometheus:latest
@@ -131,12 +203,17 @@ services:
       - "--web.enable-lifecycle"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
-    ports: [ "9090:9090" ]
+    ports:
+      - "9090:9090"
     volumes:
       - prometheus-data:/prometheus
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./rules:/etc/prometheus/rules:ro
     depends_on:
+      coredns:
+        condition: service_started
+      redis:
+        condition: service_healthy
       api:
         condition: service_healthy
       worker:
@@ -144,38 +221,61 @@ services:
       alertmanager:
         condition: service_healthy
     restart: unless-stopped
-    networks: [ monitoring ]
+    networks:
+      - monitoring
     dns:
       - 8.8.8.8
-      - 8.8.4.4
+      - 1.1.1.1
+      - 172.20.0.10
     healthcheck:
-      test: [ "CMD", "wget", "-qO-", "http://localhost:9090/-/ready" ]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+
   grafana:
     image: grafana/grafana:latest
-    ports: [ "3000:3000" ]
+    ports:
+      - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_LOG_LEVEL=debug
       - GF_INSTALL_PLUGINS=
       - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
     depends_on:
+      coredns:
+        condition: service_started
       prometheus:
         condition: service_healthy
     restart: unless-stopped
-    networks: [ monitoring ]
+    networks:
+      - monitoring
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
       - ./grafana/dashboards:/var/lib/grafana/dashboards
     dns:
       - 8.8.8.8
-      - 8.8.4.4
+      - 1.1.1.1
+      - 172.20.0.10
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:3000/api/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 3
+
+
+networks:
+  monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  redis-data:
+  mailhog-data:

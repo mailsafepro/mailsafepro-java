@@ -8,7 +8,19 @@ Prevents:
 """
 
 import re
+import logging
 from typing import Any
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('sanitization_debug.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Allowed characters for Redis keys (alphanumeric + safe separators + plus for emails)
 REDIS_KEY_PATTERN = re.compile(r'^[a-zA-Z0-9:_\-\.@\+]+$')
@@ -20,7 +32,7 @@ def sanitize_redis_key(key: str, max_length: int = MAX_KEY_LENGTH) -> str:
     """
     Sanitize Redis key to prevent injection attacks.
     
-    Only allows: a-z, A-Z, 0-9, :, _, -, ., @
+    Only allows: a-z, A-Z, 0-9, :, _, -, ., @, +
     
     Args:
         key: Raw key component from user input
@@ -46,6 +58,22 @@ def sanitize_redis_key(key: str, max_length: int = MAX_KEY_LENGTH) -> str:
     
     # Remove whitespace
     key = key.strip()
+    
+    # Debug: Log the key and its components
+    logger = logging.getLogger(__name__)
+    logger.debug(f"Validating Redis key: {key!r}")
+    
+    # Check for invalid characters
+    invalid_chars = [ch for ch in key if not re.match(REDIS_KEY_PATTERN, ch)]
+    if invalid_chars:
+        logger.error(f"Invalid characters in key '{key}': {invalid_chars}")
+        logger.error(f"Key type: {type(key)}")
+        logger.error(f"Key length: {len(key)}")
+        logger.error(f"Key hex: {' '.join(f'{ord(c):02x}' for c in key)}")
+        raise ValueError(
+            f"Key contains invalid characters: {invalid_chars}. "
+            f"Only alphanumeric, colon, underscore, hyphen, dot, @, and + allowed"
+        )
     
     # Validate against pattern
     if not REDIS_KEY_PATTERN.match(key):
@@ -161,16 +189,34 @@ def build_safe_cache_key(*parts: str) -> str:
         >>> build_safe_cache_key("user", "123", "validation", "test@example.com")
         'user:123:validation:test@example.com'
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if not parts:
         raise ValueError("At least one key part required")
     
+    logger.debug(f"Building cache key from parts: {parts}")
+    
     sanitized_parts = []
-    for part in parts:
+    for i, part in enumerate(parts):
         if not isinstance(part, str):
             part = str(part)
         
-        # Sanitize each part
-        sanitized = sanitize_redis_key(part)
-        sanitized_parts.append(sanitized)
+        logger.debug(f"  Part {i}: {part!r} (type: {type(part).__name__})")
+        
+        try:
+            # Sanitize each part
+            sanitized = sanitize_redis_key(part)
+            sanitized_parts.append(sanitized)
+            logger.debug(f"  Sanitized part: {sanitized!r}")
+        except ValueError as e:
+            logger.error(f"Error sanitizing part {i} {part!r}: {str(e)}")
+            logger.error(f"Part type: {type(part)}")
+            logger.error(f"Part length: {len(part)}")
+            logger.error(f"Part repr: {repr(part)}")
+            logger.error(f"Part hex: {' '.join(f'{ord(c):02x}' for c in part)}")
+            raise
     
-    return ':'.join(sanitized_parts)
+    final_key = ':'.join(sanitized_parts)
+    logger.debug(f"Final cache key: {final_key!r}")
+    return final_key

@@ -75,6 +75,12 @@ ENDPOINT_LIMITS: Dict[str, Dict[RateLimitTier, RateLimitRule]] = {
         RateLimitTier.PREMIUM: RateLimitRule(requests=50, window=3600),
         RateLimitTier.ENTERPRISE: RateLimitRule(requests=200, window=3600),
     },
+    # ✅ NUEVA REGLA ESPECÍFICA PARA USAGE
+    "/api-keys/usage": {
+        RateLimitTier.FREE: RateLimitRule(requests=120, window=3600),  # 1 cada 30s
+        RateLimitTier.PREMIUM: RateLimitRule(requests=500, window=3600),
+        RateLimitTier.ENTERPRISE: RateLimitRule(requests=2000, window=3600),
+    },
     "default": {
         RateLimitTier.ANONYMOUS: RateLimitRule(requests=30, window=60),
         RateLimitTier.FREE: RateLimitRule(requests=100, window=60),
@@ -82,6 +88,7 @@ ENDPOINT_LIMITS: Dict[str, Dict[RateLimitTier, RateLimitRule]] = {
         RateLimitTier.ENTERPRISE: RateLimitRule(requests=10000, window=60),
     },
 }
+
 
 
 # =============================================================================
@@ -252,19 +259,19 @@ return {1, current + cost, limit, remaining, window}
             }
 
         except Exception as e:
-            # ✅ FAIL OPEN: Allow request but with full limit remaining
-            # This matches the test expectation
+            # Redis falla: optamos por fail-closed relativo (10% del límite) y explicitamos modo fallback
             logger.error(
-                "Rate limit check failed - using LOCAL FALLBACK",
-                error=str(e)[:200],
-                key=key[:30]
+                "Rate limit check failed - using LOCAL FALLBACK (fail-closed 10%)",
+                extra={"error": str(e)[:200], "key": key[:30]},
             )
-
-            return True, {
-                "current": 0,
-                "limit": limit,
-                "remaining": limit,  # Full limit available on error
-                "reset_in": window,
+            allowed, metadata = self.fallback.check_limit(key, limit, window, cost)
+            # Forzamos 10% del límite original para consistencia
+            fallback_limit = max(1, limit // 10)
+            return allowed, {
+                "current": metadata.get("current", 0),
+                "limit": fallback_limit,
+                "remaining": max(0, fallback_limit - metadata.get("current", 0)),
+                "reset_in": metadata.get("reset_in", window),
                 "fallback_mode": True,
             }
 

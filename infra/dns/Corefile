@@ -1,0 +1,36 @@
+# ============================================================
+# CoreDNS Configuration for Email Validation API
+# ============================================================
+
+# Zona local para testing (.test.lab)
+test.lab:53 {
+    file /etc/coredns/zones/test.lab.db test.lab
+    log
+    errors
+    reload 5s
+}
+
+# Forward de todos los demás dominios a DNS públicos
+.:53 {
+    # DNS públicos: Google (8.8.8.8, 8.8.4.4) + Cloudflare (1.1.1.1)
+    forward . 8.8.8.8 1.1.1.1 8.8.4.4 {
+        max_concurrent 1000
+        policy round_robin
+        health_check 5s
+    }
+    
+    # Cache de 30 segundos
+    cache 30 {
+        success 10000
+        denial 5000
+    }
+    
+    log
+    errors
+    
+    # Health check endpoint
+    health :8080
+    
+    # Prometheus metrics
+    prometheus :9153
+}

@@ -247,9 +247,10 @@ class TestRateLimiterErrorHandling:
             window=60
         )
         
-        # Should allow request on Redis failure (fail open)
+        # Debe permitir con fallback conservador (10% del límite) y marcar fallback_mode
         assert allowed is True
-        assert metadata['remaining'] == 10
+        assert metadata["fallback_mode"] is True
+        assert metadata["remaining"] == 0
     
     async def test_get_current_usage_error(self, redis_mock):
         """Test get_current_usage when Redis fails"""
