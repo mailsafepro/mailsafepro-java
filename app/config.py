@@ -647,17 +647,21 @@ class Settings(BaseSettings):
             if len(api_key_secret) < 32:
                 raise ValueError("API_KEY_SECRET must be at least 32 characters in PRODUCTION")
             
+            # Make API keys optional by setting them to None if they contain test values
             vtkey = self.vt_api_key.get_secret_value()
-            if vtkey and vtkey in WEAK_DEFAULTS:  # ← Agregar "if vtkey and"
-                raise ValueError("VT_API_KEY cannot use default test value in PRODUCTION")
+            if vtkey and vtkey in WEAK_DEFAULTS:
+                self.vt_api_key = None  # Make optional by setting to None
+                logger.warning("VT_API_KEY is using test value - setting to None")
 
             clearbitkey = self.clearbit_api_key.get_secret_value()
-            if clearbitkey and clearbitkey in WEAK_DEFAULTS:  # ← Agregar "if clearbitkey and"
-                raise ValueError("CLEARBIT_API_KEY cannot use default test value in PRODUCTION")
+            if clearbitkey and clearbitkey in WEAK_DEFAULTS:
+                self.clearbit_api_key = None  # Make optional by setting to None
+                logger.warning("CLEARBIT_API_KEY is using test value - setting to None")
 
             metricskey = self.metrics_api_key.get_secret_value()
-            if metricskey and metricskey in WEAK_DEFAULTS:  # ← Agregar "if metricskey and"
-                raise ValueError("API_KEY_METRICS cannot use default test value in PRODUCTION")
+            if metricskey and metricskey in WEAK_DEFAULTS:
+                self.metrics_api_key = None  # Make optional by setting to None
+                logger.warning("API_KEY_METRICS is using test value - setting to None")
             
             # SMTP credentials if not localhost
             if self.smtp_host not in {"localhost", "127.0.0.1"}:
