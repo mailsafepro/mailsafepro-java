@@ -163,16 +163,18 @@ def setup_tracing(app=None) -> None:
 def _create_exporter(config: TracingConfig):
     """Create span exporter based on configuration."""
     
-    # ✅ NUEVO: En development, NO exportar traces (reduce log noise)
-    if config.environment.lower() == "development" and config.exporter_type == "console":
-        logger.info("🔇 Console tracing disabled in development (reducing log noise)")
-        return None  # No exporter = no traces en consola
+    # ✅ NUEVO: En development O production, NO exportar a consola por defecto
+    if config.exporter_type == "console":
+        if config.environment.lower() in ["development", "production"]:
+            logger.info(f"🔇 Console tracing disabled in {config.environment} (reducing log noise)")
+            return None
+        # Solo permitir console en staging/testing
+        return ConsoleSpanExporter()
     
     if config.exporter_type == "jaeger":
         if not JAEGER_AVAILABLE:
             logger.warning("Jaeger exporter not available, install opentelemetry-exporter-jaeger")
             return None
-        
         return JaegerExporter(
             agent_host_name=config.jaeger_agent_host,
             agent_port=config.jaeger_agent_port,
@@ -182,19 +184,20 @@ def _create_exporter(config: TracingConfig):
         if not OTLP_AVAILABLE:
             logger.warning("OTLP exporter not available, install opentelemetry-exporter-otlp")
             return None
-        
         return OTLPSpanExporter(
             endpoint=config.otlp_endpoint,
-            insecure=True,  # Use TLS in production
+            insecure=True,
         )
     
-    elif config.exporter_type == "console":
-        # Solo en production/staging
-        return ConsoleSpanExporter()
+    elif config.exporter_type == "none":
+        # ✅ Opción explícita para deshabilitar
+        logger.info("🔇 Tracing exporter explicitly disabled")
+        return None
     
     else:
         logger.warning(f"Unknown exporter type: {config.exporter_type}")
         return None
+
 
 
 def shutdown_tracing() -> None:
