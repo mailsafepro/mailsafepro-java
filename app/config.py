@@ -14,7 +14,6 @@ import warnings
 from enum import Enum
 from functools import lru_cache
 from typing import Dict, Optional, List, Set, Any
-from app.logger import logger
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -651,17 +650,14 @@ class Settings(BaseSettings):
             vtkey = self.vt_api_key.get_secret_value()
             if vtkey and vtkey in WEAK_DEFAULTS:
                 self.vt_api_key = None  # Make optional by setting to None
-                logger.warning("VT_API_KEY is using test value - setting to None")
 
             clearbitkey = self.clearbit_api_key.get_secret_value()
             if clearbitkey and clearbitkey in WEAK_DEFAULTS:
                 self.clearbit_api_key = None  # Make optional by setting to None
-                logger.warning("CLEARBIT_API_KEY is using test value - setting to None")
 
             metricskey = self.metrics_api_key.get_secret_value()
             if metricskey and metricskey in WEAK_DEFAULTS:
                 self.metrics_api_key = None  # Make optional by setting to None
-                logger.warning("API_KEY_METRICS is using test value - setting to None")
             
             # SMTP credentials if not localhost
             if self.smtp_host not in {"localhost", "127.0.0.1"}:
