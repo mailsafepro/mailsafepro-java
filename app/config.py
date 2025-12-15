@@ -14,7 +14,7 @@ import warnings
 from enum import Enum
 from functools import lru_cache
 from typing import Dict, Optional, List, Set, Any
-
+from app.logger import logger
 from pydantic import (
     BaseModel,
     ConfigDict,
