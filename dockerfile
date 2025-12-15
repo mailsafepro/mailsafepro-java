@@ -74,4 +74,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 EXPOSE ${PORT}
 
 # Start application with uvicorn
-CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 4
+CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+

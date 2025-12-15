@@ -158,8 +158,8 @@ _global_fallback = LocalRateLimiterFallback()
 
 # ✅ MEJORA 1: Robust Redis initialization with retry logic
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=2, max=5),
     retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True
@@ -255,59 +255,73 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     app.state.redis_available = False
     app.state.arq_available = False
 
-    # ✅ MEJORA: Try to initialize Redis with retry logic
+    # ✅ MEJORA: Try to initialize Redis with TIMEOUT (no bloquear startup)
     try:
         redis_url = str(settings.redis_url)
-        app.state.redis = await initialize_redis_with_retry(redis_url)
+        app.state.redis = await asyncio.wait_for(
+            initialize_redis_with_retry(redis_url),
+            timeout=10.0  # ← Timeout máximo de 10 segundos
+        )
         app.state.redis_available = True
 
+    except asyncio.TimeoutError:
+        logger.warning("⚠️ Redis initialization timeout after 10s - running without cache")
     except Exception as e:
         logger.warning(
-            f"⚠️ Redis initialization failed after retries: {str(e)} - "
+            f"⚠️ Redis initialization failed: {str(e)} - "
             f"running in degraded mode without cache"
         )
 
-        # ✅ MEJORA 3: Check if Redis is required
-        if getattr(settings, 'redis_required', False):
-            logger.error("❌ Redis is required but unavailable - cannot start")
-            raise RuntimeError("Redis is required but connection failed") from e
-
-    # ✅ MEJORA: Try to initialize ARQ pool
+    # ✅ MEJORA: Try to initialize ARQ pool with TIMEOUT
     if app.state.redis:
         try:
             redis_url = str(settings.redis_url)
-            app.state.arq_redis = await initialize_arq_with_retry(redis_url)
+            app.state.arq_redis = await asyncio.wait_for(
+                initialize_arq_with_retry(redis_url),
+                timeout=10.0  # ← Timeout máximo de 10 segundos
+            )
             app.state.arq_available = True
 
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ ARQ pool initialization timeout after 10s - batch jobs disabled")
+            service_health.labels(service='arq').set(0)
         except Exception as e:
             logger.warning(f"⚠️ ARQ pool initialization failed: {e} - batch jobs disabled")
             service_health.labels(service='arq').set(0)
 
-    # ✅ Warm up connections if Redis is available
+    # ✅ Warm up connections if Redis is available (with timeout)
     if app.state.redis:
         try:
-            await warm_up_connections(app.state.redis)
+            await asyncio.wait_for(
+                warm_up_connections(app.state.redis),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Connection warm-up timeout")
         except Exception as e:
             logger.warning(f"⚠️ Connection warm-up failed: {e}")
 
-    # ✅ Initialize services
+    # ✅ Initialize services (with timeout)
     if app.state.redis:
         try:
-            await initialize_services(app)
+            await asyncio.wait_for(
+                initialize_services(app),
+                timeout=10.0
+            )
             service_health.labels(service='app').set(1)
-        except Exception as e:
-            logger.error(f"❌ Service initialization failed: {e}")
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Service initialization timeout - continuing anyway")
             service_health.labels(service='app').set(0)
-
-            # ✅ MEJORA 3: Decide if we can continue without services
-            if getattr(settings, 'services_required', True):
-                raise
+        except Exception as e:
+            logger.warning(f"⚠️ Service initialization failed: {e} - continuing anyway")
+            service_health.labels(service='app').set(0)
 
     # Record startup time
     startup_duration = time.time() - startup_start_time
     app_startup_duration.observe(startup_duration)
     logger.success(f"✅ API server started successfully in {startup_duration:.2f}s")
 
+    # ✅ CRÍTICO: Este yield SIEMPRE debe ejecutarse
     try:
         yield
     finally:
@@ -319,7 +333,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         # Shutdown services
         if app.state.redis:
             try:
-                await shutdown_services(app)
+                await asyncio.wait_for(shutdown_services(app), timeout=5.0)
+            except asyncio.TimeoutError:
+                shutdown_errors.append("Service shutdown timeout")
+                logger.error("Service shutdown timeout after 5s")
             except Exception as e:
                 shutdown_errors.append(f"Service shutdown: {e}")
                 logger.error(f"Error shutting down services: {e}")
@@ -327,8 +344,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         # Close Redis connection
         if app.state.redis:
             try:
-                await app.state.redis.close()
+                await asyncio.wait_for(app.state.redis.close(), timeout=5.0)
                 logger.info("✅ Redis connection closed")
+            except asyncio.TimeoutError:
+                shutdown_errors.append("Redis close timeout")
+                logger.error("Redis close timeout after 5s")
             except Exception as e:
                 shutdown_errors.append(f"Redis close: {e}")
                 logger.error(f"Error closing Redis: {e}")
@@ -336,8 +356,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         # Close ARQ pool
         if app.state.arq_redis:
             try:
-                await app.state.arq_redis.close()
+                await asyncio.wait_for(app.state.arq_redis.close(), timeout=5.0)
                 logger.info("✅ ARQ pool closed")
+            except asyncio.TimeoutError:
+                shutdown_errors.append("ARQ close timeout")
+                logger.error("ARQ close timeout after 5s")
             except Exception as e:
                 shutdown_errors.append(f"ARQ close: {e}")
                 logger.error(f"Error closing ARQ: {e}")
