@@ -158,8 +158,8 @@ _global_fallback = LocalRateLimiterFallback()
 
 # ✅ MEJORA 1: Robust Redis initialization with retry logic
 @retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=2, max=5),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True
@@ -236,92 +236,68 @@ async def initialize_arq_with_retry(redis_url: str):
 # Lifecycle management
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """
-    ✅ IMPROVED: Enhanced application lifecycle with better error handling
-    """
     startup_start_time = time.time()
-
     logger.info(f"🚀 Starting API server in {settings.environment.value} environment")
 
-    # ✅ Testing mode bypass
     if settings.testing_mode:
         logger.info("⚡ Testing mode enabled - skipping full initialization")
         yield
         return
 
-    # Initialize state
     app.state.redis = None
     app.state.arq_redis = None
     app.state.redis_available = False
     app.state.arq_available = False
 
-    # ✅ MEJORA: Try to initialize Redis with TIMEOUT (no bloquear startup)
+    # ✅ Aumentar timeout de 10s a 30s
     try:
         redis_url = str(settings.redis_url)
         app.state.redis = await asyncio.wait_for(
             initialize_redis_with_retry(redis_url),
-            timeout=10.0  # ← Timeout máximo de 10 segundos
+            timeout=30.0  # ← CAMBIAR de 10.0 a 30.0
         )
         app.state.redis_available = True
-
     except asyncio.TimeoutError:
-        logger.warning("⚠️ Redis initialization timeout after 10s - running without cache")
+        logger.warning("⚠️ Redis initialization timeout after 30s - running without cache")
     except Exception as e:
-        logger.warning(
-            f"⚠️ Redis initialization failed: {str(e)} - "
-            f"running in degraded mode without cache"
-        )
+        logger.warning(f"⚠️ Redis initialization failed: {str(e)} - running in degraded mode")
 
-    # ✅ MEJORA: Try to initialize ARQ pool with TIMEOUT
+    # ✅ ARQ también con 30s
     if app.state.redis:
         try:
             redis_url = str(settings.redis_url)
             app.state.arq_redis = await asyncio.wait_for(
                 initialize_arq_with_retry(redis_url),
-                timeout=10.0  # ← Timeout máximo de 10 segundos
+                timeout=30.0  # ← CAMBIAR de 10.0 a 30.0
             )
             app.state.arq_available = True
-
         except asyncio.TimeoutError:
-            logger.warning("⚠️ ARQ pool initialization timeout after 10s - batch jobs disabled")
+            logger.warning("⚠️ ARQ pool initialization timeout after 30s")
             service_health.labels(service='arq').set(0)
         except Exception as e:
-            logger.warning(f"⚠️ ARQ pool initialization failed: {e} - batch jobs disabled")
+            logger.warning(f"⚠️ ARQ pool initialization failed: {e}")
             service_health.labels(service='arq').set(0)
 
-    # ✅ Warm up connections if Redis is available (with timeout)
+    # ✅ Warm-up con 10s está bien
     if app.state.redis:
         try:
-            await asyncio.wait_for(
-                warm_up_connections(app.state.redis),
-                timeout=5.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("⚠️ Connection warm-up timeout")
-        except Exception as e:
+            await asyncio.wait_for(warm_up_connections(app.state.redis), timeout=10.0)
+        except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"⚠️ Connection warm-up failed: {e}")
 
-    # ✅ Initialize services (with timeout)
+    # ✅ Services con 20s
     if app.state.redis:
         try:
-            await asyncio.wait_for(
-                initialize_services(app),
-                timeout=10.0
-            )
+            await asyncio.wait_for(initialize_services(app), timeout=20.0)  # ← 20s
             service_health.labels(service='app').set(1)
-        except asyncio.TimeoutError:
-            logger.warning("⚠️ Service initialization timeout - continuing anyway")
-            service_health.labels(service='app').set(0)
-        except Exception as e:
-            logger.warning(f"⚠️ Service initialization failed: {e} - continuing anyway")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"⚠️ Service initialization failed: {e}")
             service_health.labels(service='app').set(0)
 
-    # Record startup time
     startup_duration = time.time() - startup_start_time
     app_startup_duration.observe(startup_duration)
     logger.success(f"✅ API server started successfully in {startup_duration:.2f}s")
 
-    # ✅ CRÍTICO: Este yield SIEMPRE debe ejecutarse
     try:
         yield
     finally:
@@ -665,6 +641,16 @@ async def startup_check():
             detail={"status": "starting", "timestamp": time.time()}
         )
 
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return {
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health",
+        "ready": "/ready",
+        "live": "/live"
+    }
 
 @app.get("/healthcheck", tags=["Health"])
 @app.head("/healthcheck", tags=["Health"])
