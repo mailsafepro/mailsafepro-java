@@ -120,41 +120,31 @@ def setup_structured_logging() -> None:
     config = StructuredLoggingConfig()
     
     if not config.enabled:
-        logging.info("Structured logging is disabled, using standard logging")
         return
     
-    # Configure stdlib logging
+    # Configure stdlib logging with a null handler first to prevent recursion
     logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
+        handlers=[logging.NullHandler()],
         level=getattr(logging, config.log_level),
     )
     
     # Build processor chain
     processors = [
-        # Contextvars must come first
         merge_contextvars,
-        # Add custom fields
         add_timestamp,
         add_log_level,
         add_logger_name,
         add_correlation_id,
-        # Security
         redact_sensitive_data,
-        # Performance
         drop_debug_in_production,
-        # Stack info and exception formatting
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
-        # Rendering
         structlog.processors.UnicodeDecoder(),
     ]
     
     if config.json_format:
-        # JSON output for production
         processors.append(structlog.processors.JSONRenderer())
     else:
-        # Pretty console output for development
         processors.append(structlog.dev.ConsoleRenderer(colors=True))
     
     # Configure structlog
@@ -168,9 +158,12 @@ def setup_structured_logging() -> None:
         cache_logger_on_first_use=True,
     )
     
-    logging.info(
-        f"✅ Structured logging initialized "
-        f"(level={config.log_level}, json={config.json_format})"
+    # Only log after everything is configured
+    log = structlog.get_logger(__name__)
+    log.info(
+        "structured_logging_initialized",
+        level=config.log_level,
+        json=config.json_format
     )
 
 

@@ -255,20 +255,38 @@ async def general_exception_handler(
         detail=detail,
         instance=str(request.url),
         trace_id=trace_id,
-        client_plan=client_plan  # ✅ Plan correcto aquí también
+        client_plan=client_plan
     )
     
-    logger.critical(
-        "Unhandled Exception | Type: %s | Detail: %s | "
-        "Trace: %s | Plan: %s | Path: %s\n%s",
-        type(exc).__name__,
-        str(exc),
-        trace_id,
-        client_plan,
-        request.url.path,
-        error_info or "",
-        exc_info=True
-    )
+    # ✅ FIX CRÍTICO: Proteger el logging con try/except
+    # Si el logger falla, usar print() como fallback
+    try:
+        logger.critical(
+            "Unhandled Exception | Type: %s | Detail: %s | "
+            "Trace: %s | Plan: %s | Path: %s\n%s",
+            type(exc).__name__,
+            str(exc),
+            trace_id,
+            client_plan,
+            request.url.path,
+            error_info or "",
+            exc_info=True
+        )
+    except Exception as log_error:
+        # ✅ FALLBACK: Si logger falla, usar print() directo a stderr
+        import sys
+        error_msg = (
+            f"[CRITICAL ERROR] Logger failed, using fallback print\n"
+            f"Original Exception: {type(exc).__name__}: {str(exc)}\n"
+            f"Logger Error: {type(log_error).__name__}: {str(log_error)}\n"
+            f"Trace ID: {trace_id}\n"
+            f"Plan: {client_plan}\n"
+            f"Path: {request.url.path}\n"
+        )
+        if error_info:
+            error_msg += f"\nTraceback:\n{error_info}"
+        
+        print(error_msg, file=sys.stderr)
     
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
