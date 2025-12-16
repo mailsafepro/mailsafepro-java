@@ -3326,27 +3326,39 @@ _service_start_time = time.time()
 
 @router.get("/health")
 @router.head("/health")
-async def health_check(redis=Depends(get_redis)) -> Dict[str, Any]:
-    """Health check completo del servicio."""
-    try:
-        await redis.ping()
-        redis_healthy = True
-    except Exception:
-        redis_healthy = False
-
+async def health_check(request: Request) -> Dict[str, Any]:
+    """Health check completo del servicio de validación."""
+    
+    # ✅ Obtener Redis sin dependency (no falla si no está disponible)
+    redis = getattr(request.app.state, 'redis', None)
+    redis_available = getattr(request.app.state, 'redis_available', False)
+    
+    # Verificar Redis
+    redis_healthy = False
+    if redis and redis_available:
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=1.0)
+            redis_healthy = True
+        except Exception as e:
+            from app.logger import logger
+            logger.warning(f"Redis ping failed in health check: {e}")
+            redis_healthy = False
+    
     # Estas verificaciones pueden ampliarse con checks reales
     dns_healthy = True
     smtp_healthy = True
-
-    overall_status = "healthy" if all([redis_healthy, dns_healthy, smtp_healthy]) else "degraded"
+    
+    # ✅ Siempre retorna 200 OK, incluso en modo degradado
+    overall_status = "healthy" if redis_healthy else "degraded"
+    
     return {
         "status": overall_status,
         "timestamp": datetime.utcnow().isoformat(),
         "version": "2.0.0",
         "services": {
-            "redis": "healthy" if redis_healthy else "unhealthy",
-            "dns": "healthy" if dns_healthy else "unhealthy",
-            "smtp": "healthy" if smtp_healthy else "unhealthy",
+            "redis": "healthy" if redis_healthy else "degraded",
+            "dns": "healthy" if dns_healthy else "unknown",
+            "smtp": "healthy" if smtp_healthy else "unknown",
         },
         "uptime": round(time.time() - _service_start_time, 2),
     }

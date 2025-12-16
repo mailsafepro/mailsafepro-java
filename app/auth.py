@@ -8,6 +8,7 @@ import json
 import re
 import time
 from uuid import uuid4
+import asyncio
 
 from passlib.context import CryptContext
 import jwt
@@ -1572,11 +1573,30 @@ async def validate_api_key_string(
 
 @router.get("/health/auth")
 @router.head("/health/auth")
-async def auth_health_check(redis: Redis = Depends(get_redis)):
+async def auth_health_check(request: Request):
     """Health check para autenticación: Redis, JWT y hashing."""
+    
+    # ✅ Obtener Redis sin dependency (no falla si no está disponible)
+    redis = getattr(request.app.state, 'redis', None)
+    redis_available = getattr(request.app.state, 'redis_available', False)
+    
+    redis_status = "disconnected"
+    jwt_status = "unknown"
+    hashing_status = "unknown"
+    
+    # Test 1: Redis
+    if redis and redis_available:
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=1.0)
+            redis_status = "connected"
+        except Exception as e:
+            logger.warning(f"Redis ping failed in auth health: {e}")
+            redis_status = "degraded"
+    else:
+        redis_status = "unavailable"
+    
+    # Test 2: JWT (no depende de Redis)
     try:
-        await redis.ping()
-
         test_token = create_access_token({"sub": "health_check", "test": True}, plan="FREE")
         _ = jwt.decode(
             test_token,
@@ -1585,21 +1605,31 @@ async def auth_health_check(redis: Redis = Depends(get_redis)):
             audience=settings.jwt.audience,
             issuer=settings.jwt.issuer,
         )
-
+        jwt_status = "working"
+    except Exception as e:
+        logger.error(f"JWT test failed: {e}")
+        jwt_status = "broken"
+    
+    # Test 3: Password hashing (no depende de Redis)
+    try:
         test_password = "health_check_password"
         hashed = get_password_hash(test_password)
         password_valid = verify_password(test_password, hashed)
-
-        return {
-            "status": "healthy",
-            "redis": "connected",
-            "jwt": "working",
-            "password_hashing": "working" if password_valid else "broken",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        hashing_status = "working" if password_valid else "broken"
     except Exception as e:
-        logger.error("Auth health check failed: %s", e)
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication service unhealthy")
+        logger.error(f"Password hashing test failed: {e}")
+        hashing_status = "broken"
+    
+    # ✅ Siempre retorna 200 OK con el estado de cada componente
+    overall_status = "healthy" if redis_status == "connected" else "degraded"
+    
+    return {
+        "status": overall_status,
+        "redis": redis_status,
+        "jwt": jwt_status,
+        "password_hashing": hashing_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # =============================================================================
