@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from collections import defaultdict
 import threading
+import sys
 
 from fastapi import Request, HTTPException, status
 from redis.asyncio import Redis
@@ -99,28 +100,63 @@ class LocalRateLimiterFallback:
     """
     In-memory rate limiter for when Redis is unavailable.
     Uses conservative limits (10% of normal) for security.
+    Thread-safe and recursion-safe implementation.
     """
     def __init__(self):
-        self._counters: Dict[str, List[float]] = defaultdict(list)
-        self._lock = threading.Lock()
+        self._counters: Dict[str, List[float]] = {}
+        self._lock = threading.RLock()  # Use RLock for thread safety in recursive calls
         self._last_cleanup = time.time()
         self._cleanup_interval = 60
+        self._in_cleanup = False  # Prevent recursive cleanup
+        self._in_check = threading.local()  # Thread-local storage for recursion detection
 
     def _cleanup_old_entries(self) -> None:
         """Remove expired entries to prevent memory bloat."""
-        now = time.time()
-        if now - self._last_cleanup < self._cleanup_interval:
+        # Prevent recursive cleanup
+        if getattr(self, '_in_cleanup', False):
             return
+            
+        try:
+            self._in_cleanup = True
+            now = time.time()
+            
+            # Only cleanup every _cleanup_interval seconds
+            if now - self._last_cleanup < self._cleanup_interval:
+                return
 
-        cutoff = now - 3600
-        for key in list(self._counters.keys()):
-            self._counters[key] = [
-                ts for ts in self._counters[key] if ts > cutoff
-            ]
-            if not self._counters[key]:
-                del self._counters[key]
+            cutoff = now - 3600  # 1 hour TTL for entries
+            
+            # Make a copy of keys to avoid modifying dict during iteration
+            keys = list(self._counters.keys())
+            
+            for key in keys:
+                try:
+                    with self._lock:
+                        if key in self._counters:  # Check again after acquiring lock
+                            # Filter out old timestamps
+                            self._counters[key] = [
+                                ts for ts in self._counters[key] if ts > cutoff
+                            ]
+                            # Remove empty lists
+                            if not self._counters[key]:
+                                del self._counters[key]
+                except Exception as e:
+                    # Log error but don't fail
+                    try:
+                        print(f"Error cleaning up rate limit key {key}: {str(e)}", file=sys.stderr)
+                    except:
+                        pass
 
-        self._last_cleanup = now
+            self._last_cleanup = now
+            
+        except Exception as e:
+            # Log error but don't fail
+            try:
+                print(f"Error in rate limit cleanup: {str(e)}", file=sys.stderr)
+            except:
+                pass
+        finally:
+            self._in_cleanup = False
 
     def check_limit(
         self,
@@ -132,43 +168,90 @@ class LocalRateLimiterFallback:
         """
         Check rate limit using local memory.
         CONSERVATIVE: Uses 10% of normal limit.
+        Thread-safe and recursion-safe implementation.
         """
-        now = time.time()
-        window_start = now - window
-
-        with self._lock:
-            self._cleanup_old_entries()
-
-            self._counters[key] = [
-                ts for ts in self._counters[key] if ts > window_start
-            ]
-
-            current = len(self._counters[key])
-
-            # CRITICAL: Use 10% of normal limit as fallback
-            fallback_limit = max(1, limit // 10)
-
-            if current + cost > fallback_limit:
-                return False, {
-                    "current": current,
-                    "limit": fallback_limit,
-                    "remaining": 0,
-                    "reset_in": window,
-                    "fallback_mode": True,
-                }
-
-            for _ in range(cost):
-                self._counters[key].append(now)
-
-            remaining = fallback_limit - (current + cost)
-
-            return True, {
-                "current": current + cost,
-                "limit": fallback_limit,
-                "remaining": max(0, remaining),
-                "reset_in": window,
+        # Initialize thread-local state if not exists
+        if not hasattr(self._in_check, 'active'):
+            self._in_check.active = False
+            
+        # Detect recursion
+        if self._in_check.active:
+            # If we're already in a check, fail closed for safety
+            return False, {
+                "current": 0,
+                "limit": 1,
+                "remaining": 0,
+                "reset_in": 60,
                 "fallback_mode": True,
+                "error": "recursion_detected"
             }
+            
+        try:
+            self._in_check.active = True
+            now = time.time()
+            window_start = now - window
+            
+            # CRITICAL: Use 10% of normal limit as fallback, minimum 1
+            fallback_limit = max(1, limit // 10)
+            
+            with self._lock:
+                # Clean up old entries (with recursion protection)
+                self._cleanup_old_entries()
+                
+                # Initialize key if not exists
+                if key not in self._counters:
+                    self._counters[key] = []
+                
+                # Filter out old timestamps
+                self._counters[key] = [
+                    ts for ts in self._counters[key] if ts > window_start
+                ]
+                
+                current = len(self._counters[key])
+                
+                # Check if we're over the limit
+                if current + cost > fallback_limit:
+                    return False, {
+                        "current": current,
+                        "limit": fallback_limit,
+                        "remaining": 0,
+                        "reset_in": int(window - (now - self._counters[key][0])) if self._counters[key] else window,
+                        "fallback_mode": True,
+                        "error": "rate_limit_exceeded"
+                    }
+                
+                # Add new request timestamps
+                self._counters[key].extend([now] * cost)
+                
+                # Calculate remaining requests
+                remaining = fallback_limit - (current + cost)
+                
+                return True, {
+                    "current": current + cost,
+                    "limit": fallback_limit,
+                    "remaining": max(0, remaining),
+                    "reset_in": window,
+                    "fallback_mode": True
+                }
+                
+        except Exception as e:
+            # Log error but fail closed for security
+            try:
+                print(f"Rate limit check error for key {key}: {str(e)}", file=sys.stderr)
+            except:
+                pass
+                
+            return False, {
+                "current": 0,
+                "limit": 1,
+                "remaining": 0,
+                "reset_in": 60,
+                "fallback_mode": True,
+                "error": str(e)
+            }
+            
+        finally:
+            self._in_check.active = False
 
 
 # =============================================================================
