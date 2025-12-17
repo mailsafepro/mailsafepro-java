@@ -153,11 +153,11 @@ def setup_tracing(app=None) -> None:
     if _config.instrument_http:
         try:
             AioHttpClientInstrumentor().instrument()
-            logger.success("✅ HTTP client instrumented for tracing")
+            logger.bind(request_id="system").success("✅ HTTP client instrumented for tracing")
         except Exception as e:
-            logger.error(f"Failed to instrument HTTP client: {e}")
+            logger.bind(request_id="system").error(f"Failed to instrument HTTP client: {e}")
     
-    logger.success(f"🔍 Distributed tracing initialized for {_config.service_name}")
+    logger.bind(request_id="system").success(f"🔍 Distributed tracing initialized for {_config.service_name}")
 
 
 def _create_exporter(config: TracingConfig):
@@ -166,7 +166,7 @@ def _create_exporter(config: TracingConfig):
     # ✅ NUEVO: En development O production, NO exportar a consola por defecto
     if config.exporter_type == "console":
         if config.environment.lower() in ["development", "production"]:
-            logger.info(f"🔇 Console tracing disabled in {config.environment} (reducing log noise)")
+            logger.bind(request_id="system").info(f"🔇 Console tracing disabled in {config.environment} (reducing log noise)")
             return None
         # Solo permitir console en staging/testing
         return ConsoleSpanExporter()

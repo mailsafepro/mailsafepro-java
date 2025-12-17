@@ -9,10 +9,13 @@ def setup_logging(environment=None):
         environment: Optional environment override. If not provided, will use ENVIRONMENT env var.
     """
     def ensure_request_id(record):
+        if "extra" not in record:
+            record["extra"] = {}
         if "request_id" not in record["extra"]:
-            record["extra"]["request_id"] = "no-id"
+            record["extra"]["request_id"] = "system"
         if "security_event" not in record["extra"]:
             record["extra"]["security_event"] = False
+        return record  # Ensure we return the modified record
 
     _loguru_logger.remove()
     patched_logger = _loguru_logger.patch(ensure_request_id)
@@ -27,7 +30,7 @@ def setup_logging(environment=None):
         retention="30 days",
         serialize=env == "production",
         enqueue=True,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {extra[request_id]} | {message}",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{extra[request_id]:<36}</cyan> | <level>{message}</level>",
         level="DEBUG" if env != "production" else "INFO",
         backtrace=env != "production",
         diagnose=env != "production"
@@ -37,7 +40,7 @@ def setup_logging(environment=None):
     if env != "production":
         patched_logger.add(
             sys.stderr,
-            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {extra[request_id]} | {message}",
+            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{extra[request_id]:<36}</cyan> | <level>{message}</level>",
             level="DEBUG",
             backtrace=True,
             diagnose=True
