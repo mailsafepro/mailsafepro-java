@@ -25,6 +25,7 @@ from app.rate_limiting.advanced_rate_limiting import (
     get_circuit_breaker_status
 )
 
+from app.logger import logger
 
 if os.getenv("ENVIRONMENT", "development") != "production":
     load_dotenv(override=False)
@@ -37,7 +38,6 @@ setattr(_status, "HTTP_401_UNANAUTHORIZED", _status.HTTP_401_UNAUTHORIZED)
 
 # Import configs and enums
 from app.config import settings, EnvironmentEnum
-from app.logger import logger
 
 # Initialize observability early
 from app.structured_logging import setup_structured_logging
