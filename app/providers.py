@@ -717,7 +717,7 @@ def _is_mock(obj) -> bool:
         return False
 
 async def check_spf(domain: str) -> str:
-    """Búsqueda SPF robusta con fallback. Retorna el record SPF completo o 'no-spf'."""
+    """Búsqueda SPF robusta con nameservers configurados."""
     name = (domain or "").strip().lower()
     if not name:
         return "no-spf"
@@ -725,9 +725,17 @@ async def check_spf(domain: str) -> str:
     try:
         import dns.resolver
         import dns.rdatatype
+        import dns.exception
         
+        # ✅ CRÍTICO: Crear resolver con nameservers configurados
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
+        resolver.timeout = 3.0  # ← 3 segundos (antes: sin configurar)
+        resolver.lifetime = 5.0  # ← Máximo 5 segundos total
+        
+        # ✅ Usar asyncio.to_thread con el resolver configurado
         answers = await asyncio.to_thread(
-            dns.resolver.resolve,
+            resolver.resolve,  # ← Usar NUESTRO resolver, no dns.resolver.resolve
             name,
             dns.rdatatype.TXT,
             raise_on_no_answer=False
@@ -738,14 +746,78 @@ async def check_spf(domain: str) -> str:
                 for txt_string in rdata.strings:
                     txt_str = txt_string.decode('utf-8', errors='ignore').strip()
                     if txt_str.startswith('v=spf1'):
-                        logger.debug(f"[SPF] Found for {name}: {txt_str[:80]}...")
-                        return txt_str  # ← RETORNA EL RECORD COMPLETO
+                        logger.info(f"✅ SPF Found for {name}: {txt_str[:80]}...")
+                        return txt_str
         
+        logger.debug(f"SPF not found for {name}")
         return "no-spf"
-    
+        
+    except dns.resolver.NXDOMAIN:
+        logger.debug(f"Domain {name} does not exist (NXDOMAIN)")
+        return "no-spf"
+    except dns.resolver.NoAnswer:
+        logger.debug(f"No TXT records for {name}")
+        return "no-spf"
+    except dns.exception.Timeout:
+        logger.warning(f"⏱️ SPF DNS timeout for {name} after 5s")
+        return "timeout"  # ← Distinguir timeout de not_found
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱️ SPF asyncio timeout for {name}")
+        return "timeout"
     except Exception as e:
-        logger.debug(f"SPF check failed for {name}: {str(e)}")
-        return "no-spf"
+        logger.warning(f"SPF check error for {name}: {str(e)}")
+        return "error"
+
+
+async def check_dmarc(domain: str) -> str:
+    """Búsqueda DMARC robusta con nameservers configurados."""
+    d = normalize_domain(domain)
+    
+    try:
+        import dns.resolver
+        import dns.rdatatype
+        import dns.exception
+        
+        # ✅ CRÍTICO: Crear resolver con nameservers configurados
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
+        resolver.timeout = 3.0
+        resolver.lifetime = 5.0
+        
+        qname = f"_dmarc.{d}"
+        
+        # ✅ Usar NUESTRO resolver
+        answers = await asyncio.to_thread(
+            resolver.resolve,  # ← NO dns.resolver.resolve
+            qname,
+            dns.rdatatype.TXT,
+            raise_on_no_answer=False
+        )
+        
+        if answers:
+            for rdata in answers:
+                for txt_string in rdata.strings:
+                    txt_str = txt_string.decode('utf-8', errors='ignore').strip()
+                    if txt_str.lower().startswith("v=dmarc1"):
+                        logger.info(f"✅ DMARC Found for {d}: {txt_str[:80]}...")
+                        return txt_str
+        
+        logger.debug(f"DMARC not found for _dmarc.{d}")
+        return "no-dmarc"
+        
+    except dns.resolver.NXDOMAIN:
+        return "no-dmarc"
+    except dns.resolver.NoAnswer:
+        return "no-dmarc"
+    except dns.exception.Timeout:
+        logger.warning(f"⏱️ DMARC DNS timeout for _dmarc.{d} after 5s")
+        return "timeout"
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱️ DMARC asyncio timeout for _dmarc.{d}")
+        return "timeout"
+    except Exception as e:
+        logger.warning(f"DMARC check error for {d}: {str(e)}")
+        return "error"
 
 
 async def check_dkim(domain: str) -> DKIMInfo:
@@ -769,37 +841,6 @@ async def check_dkim(domain: str) -> DKIMInfo:
         await async_cache_set(cache_key, asdict(result), ttl=config.mx_cache_ttl)
         
     return result
-
-
-async def check_dmarc(domain: str) -> str:
-    """Búsqueda DMARC robusta. Retorna el record DMARC completo o 'no-dmarc'."""
-    d = normalize_domain(domain)
-    
-    try:
-        import dns.resolver
-        import dns.rdatatype
-        
-        qname = f"_dmarc.{d}"
-        answers = await asyncio.to_thread(
-            dns.resolver.resolve,
-            qname,
-            dns.rdatatype.TXT,
-            raise_on_no_answer=False
-        )
-        
-        if answers:
-            for rdata in answers:
-                for txt_string in rdata.strings:
-                    txt_str = txt_string.decode('utf-8', errors='ignore').strip()
-                    if txt_str.lower().startswith('v=dmarc1'):
-                        logger.debug(f"[DMARC] Found for {d}: {txt_str[:80]}...")
-                        return txt_str  # ← RETORNA EL RECORD COMPLETO
-        
-        return "no-dmarc"
-    
-    except Exception as e:
-        logger.debug(f"DMARC check failed for {d}: {str(e)}")
-        return "no-dmarc"
 
 
 # -----------------------
@@ -964,12 +1005,15 @@ def calculate_initial_reputation(
     """
     Calcula reputación 0-1 basada en:
     - Proveedor conocido: 1.0
-    - Dominio tiene DKIM: 0.9
-    - Dominio tiene SPF+DMARC: 0.8
-    - Dominio nuevo/desconocido: 0.5
+    - Dominio con DKIM+SPF+DMARC: 0.9
+    - Dominio con SPF+DMARC: 0.75
+    - Dominio con solo SPF o DMARC: 0.6
+    - Dominio con solo DKIM: 0.65
+    - Dominio desconocido: 0.5
     - Dominio sin seguridad: 0.3
-    """
     
+    Nota: Los timeouts/errores en SPF/DMARC no penalizan la reputación.
+    """
     provider_name_lower = (provider_name or "").lower()
     
     # ✅ TIER 1: Proveedores PREMIUM (siempre 1.0)
@@ -981,32 +1025,35 @@ def calculate_initial_reputation(
     if provider_name_lower in tier1_providers:
         return 1.0
     
-    # ✅ TIER 2: Dominio con excelente seguridad (0.9)
+    # ✅ IGNORAR TIMEOUT/ERROR en cálculo (no penalizar)
     has_dkim = dkim and dkim.status == "valid"
-    has_spf = spf and spf != "no-spf" and spf.startswith("v=spf1")
-    has_dmarc = dmarc and dmarc != "no-dmarc" and dmarc.startswith("v=DMARC1")
+    has_spf = (spf and 
+               spf not in ("no-spf", "timeout", "error", "") and 
+               spf.startswith("v=spf1"))
+    has_dmarc = (dmarc and 
+                 dmarc not in ("no-dmarc", "timeout", "error", "") and 
+                 "v=DMARC1" in dmarc.upper())
     
+    # TIER 2: Excelente seguridad DNS (0.9)
     if has_dkim and has_spf and has_dmarc:
         return 0.9
     
-    # ✅ TIER 3: Dominio con SPF+DMARC pero sin DKIM (0.75)
+    # TIER 3: SPF+DMARC sin DKIM (0.75)
     if has_spf and has_dmarc:
         return 0.75
     
-    # ✅ TIER 4: Dominio con solo SPF o DMARC (0.6)
+    # TIER 4: Solo SPF o DMARC (0.6)
     if has_spf or has_dmarc:
         return 0.6
     
-    # ✅ TIER 5: Dominio con DKIM pero sin SPF/DMARC (0.65)
+    # TIER 5: Solo DKIM (0.65)
     if has_dkim:
         return 0.65
     
-    # ✅ TIER 6: Dominio sin seguridad (0.4)
-    if not provider_name_lower:
-        return 0.3
-    
-    # ✅ Neutral: Dominio desconocido (0.5)
-    return 0.5
+    # TIER 6: Sin seguridad DNS
+    # Si no hay nombre de proveedor, es un dominio desconocido (0.3)
+    # Si hay nombre de proveedor pero sin seguridad, es neutral (0.5)
+    return 0.5 if provider_name_lower else 0.3
 
 async def update_reputation(redis: Optional[RedisLike], fingerprint: str, success: bool) -> None:
     if not fingerprint:
@@ -1326,30 +1373,41 @@ async def _analyze_provider_internal(email: str, domain: str) -> ProviderAnalysi
         
         # PASO 3: Obtener DNS records en paralelo (SPF/DKIM/DMARC) con timeout individual
         try:
-            if hasattr(asyncio, "TaskGroup"):
-                async with asyncio.TaskGroup() as tg:  # type: ignore[attr-defined]
-                    spf_task = tg.create_task(asyncio.wait_for(check_spf(domain), timeout=1.5))
-                    dkim_task = tg.create_task(asyncio.wait_for(check_dkim(domain), timeout=1.5))
-                    dmarc_task = tg.create_task(asyncio.wait_for(check_dmarc(domain), timeout=1.5))
-                    
-                spf = spf_task.result() if not spf_task.cancelled() else "no-spf"
-                dkim_info = dkim_task.result() if not dkim_task.cancelled() else DKIMInfo(...)
-                dmarc = dmarc_task.result() if not dmarc_task.cancelled() else "no-dmarc"
-            else:
-                # Python 3.10 o anterior
-                spf, dkim_info, dmarc = await asyncio.gather(
-                    asyncio.wait_for(check_spf(domain), timeout=1.5),
-                    asyncio.wait_for(check_dkim(domain), timeout=1.5),
-                    asyncio.wait_for(check_dmarc(domain), timeout=1.5),
-                    return_exceptions=True  # ← CRÍTICO
-                )
-        
+            # ✅ TIMEOUT 6 SEGUNDOS (antes: 3.0s)
+            spf, dkim_info, dmarc = await asyncio.gather(
+                asyncio.wait_for(check_spf(domain), timeout=6.0),
+                asyncio.wait_for(check_dkim(domain), timeout=6.0),
+                asyncio.wait_for(check_dmarc(domain), timeout=6.0),
+                return_exceptions=True
+            )
+            
+            # ✅ MANEJO ROBUSTO: Convertir timeout exceptions y validar timeouts
+            if isinstance(spf, asyncio.TimeoutError) or spf == "timeout":
+                spf = "timeout"
+                logger.warning(f"SPF check timeout for {domain}")
+            elif isinstance(spf, Exception):
+                spf = "error"
+                logger.warning(f"SPF check failed for {domain}: {str(spf)}")
+            
+            if isinstance(dmarc, asyncio.TimeoutError) or dmarc == "timeout":
+                dmarc = "timeout"
+                logger.warning(f"DMARC check timeout for {domain}")
+            elif isinstance(dmarc, Exception):
+                dmarc = "error"
+                logger.warning(f"DMARC check failed for {domain}: {str(dmarc)}")
+                
+            if isinstance(dkim_info, asyncio.TimeoutError):
+                dkim_info = DKIMInfo(status="timeout", record=None, selector=None, key_type=None, key_length=None)
+                logger.warning(f"DKIM check timeout for {domain}")
+            elif isinstance(dkim_info, Exception):
+                dkim_info = DKIMInfo(status="error", record=None, selector=None, key_type=None, key_length=None)
+                logger.warning(f"DKIM check failed for {domain}: {str(dkim_info)}")
+                
         except Exception as e:
-            logger.debug(f"DNS checks failed: {e}")
-            spf = "no-spf"
-            dkim_info = DKIMInfo(status="not_found", record=None, selector=None,
-                                key_type=None, key_length=None)
-            dmarc = "no-dmarc"
+            logger.warning(f"DNS checks failed for {domain}: {str(e)}")
+            spf = "error"
+            dkim_info = DKIMInfo(status="error", record=None, selector=None, key_type=None, key_length=None)
+            dmarc = "error"
         
         # PASO 4: Clasificar y calcular reputación
         provider = provider_classifier.classify(primary_mx, asn_info)

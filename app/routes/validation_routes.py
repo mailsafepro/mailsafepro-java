@@ -613,6 +613,34 @@ class ResponseBuilder:
 
 
     @staticmethod
+    def map_spf_status(spf_record: str) -> str:
+        """Convierte record SPF a status para API."""
+        if not spf_record or spf_record in ("no-spf", ""):
+            return "not_found"
+        elif spf_record == "timeout":
+            return "timeout"
+        elif spf_record == "error":
+            return "error"
+        elif spf_record.startswith("v=spf1"):
+            return "pass"  # ✅ RFC 7208 compliant
+        else:
+            return "unknown"
+
+    @staticmethod
+    def map_dmarc_status(dmarc_record: str) -> str:
+        """Convierte record DMARC a status para API."""
+        if not dmarc_record or dmarc_record in ("no-dmarc", ""):
+            return "not_found"
+        elif dmarc_record == "timeout":
+            return "timeout"
+        elif dmarc_record == "error":
+            return "error"
+        elif dmarc_record.lower().startswith("v=dmarc1"):
+            return "pass"  # ✅ RFC 7489 compliant
+        else:
+            return "unknown"
+
+    @staticmethod
     def _calculate_quality_score(
         spf_status: Optional[str],
         dkim_status: Optional[str],
@@ -633,9 +661,10 @@ class ResponseBuilder:
         base_score = max(0.0, min(1.0, reputation))
         security_bonus = 0.0
         
-        spf_valid = (spf_status or "").lower() == "valid"
-        dkim_valid = (dkim_status or "").lower() == "valid"
-        dmarc_valid = (dmarc_status or "").lower() == "valid"
+        # Mapear estados a valores booleanos para el cálculo de calidad
+        spf_valid = (spf_status or "").lower() in ["pass", "valid"]
+        dkim_valid = (dkim_status or "").lower() in ["pass", "valid"]
+        dmarc_valid = (dmarc_status or "").lower() in ["pass", "valid"]
         
         if spf_valid:
             security_bonus += 0.1
@@ -1378,14 +1407,14 @@ class EmailValidationEngine:
                 fingerprint=provider_analysis.fingerprint,
                 reputation=safe_reputation,
                 include_raw_dns=include_raw_dns,
-                spf_status="valid" if provider_analysis.dns_auth.spf and provider_analysis.dns_auth.spf != "no-spf" else "not_found",
+                spf_status=ResponseBuilder.map_spf_status(provider_analysis.dns_auth.spf),
                 spf_record=provider_analysis.dns_auth.spf if include_raw_dns else None,
                 dkim_status=provider_analysis.dns_auth.dkim.status,
                 dkim_record=provider_analysis.dns_auth.dkim.record if include_raw_dns else None,
                 dkim_selector=provider_analysis.dns_auth.dkim.selector,
                 dkim_key_type=provider_analysis.dns_auth.dkim.key_type,
                 dkim_key_length=provider_analysis.dns_auth.dkim.key_length,
-                dmarc_status="valid" if provider_analysis.dns_auth.dmarc and provider_analysis.dns_auth.dmarc != "no-dmarc" else "not_found",
+                dmarc_status=ResponseBuilder.map_dmarc_status(provider_analysis.dns_auth.dmarc),
                 dmarc_record=provider_analysis.dns_auth.dmarc if include_raw_dns else None,
                 smtp_detail=smtp_result["detail"],
                 risk_score=risk_score_01,

@@ -1,22 +1,46 @@
+# Standard library imports
+import os
+import sys
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Optional
+
+# Third-party imports
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.openapi.docs import get_redoc_html
 from fastapi.middleware.cors import CORSMiddleware as FastAPICORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
 from redis.asyncio import Redis
 from arq import create_pool
 from arq.connections import RedisSettings
 import starlette.status as _status
-import os
-import asyncio
-import logging
 from pydantic import BaseModel, EmailStr
-import os
 from dotenv import load_dotenv
-import time
-# ✅ AÑADIR: Rate limiting integrado con circuit breakers
+
+# 1. Load environment variables first (before any other app imports)
+env = os.getenv("ENVIRONMENT", "development")
+if env != "production":
+    load_dotenv(override=False)
+
+# 2. Import and configure logger early (minimal configuration)
+from loguru import logger as _loguru_logger
+
+# Configure basic logger before any other imports
+_loguru_logger.remove()
+_loguru_logger.add(
+    sys.stderr,
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}",
+    level="DEBUG" if env != "production" else "INFO"
+)
+
+# 3. Now import application modules
+# Import config after environment is loaded
+from app.config import settings, EnvironmentEnum
+
+# Import rate limiting after config is available
 from app.rate_limiting.advanced_rate_limiting import (
     RateLimitManager,
     add_rate_limit_headers,
@@ -25,25 +49,15 @@ from app.rate_limiting.advanced_rate_limiting import (
     get_circuit_breaker_status
 )
 
-from app.logger import logger
+# Now we can import the logger module and configure it properly
+from app.logger import setup_logging
+logger = setup_logging(environment=env)
 
-if os.getenv("ENVIRONMENT", "development") != "production":
-    load_dotenv(override=False)
-    logger.info("📋 Loaded environment variables from .env file (development mode)")
-else:
-    logger.info("☁️ Running in production, using system environment variables")
-
-# Compat alias for historical typo in some libs
-setattr(_status, "HTTP_401_UNANAUTHORIZED", _status.HTTP_401_UNAUTHORIZED)
-
-# Import configs and enums
-from app.config import settings, EnvironmentEnum
-
-# Initialize observability early
+# Set up structured logging and tracing
 from app.structured_logging import setup_structured_logging
 from app.tracing import setup_tracing, shutdown_tracing
 
-# Setup structured logging first (before any logging occurs)
+# Initialize observability
 setup_structured_logging()
 
 # Import security scheme and routers
