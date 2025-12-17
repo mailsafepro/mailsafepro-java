@@ -116,7 +116,7 @@ class SecuritySettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="SECURITY_",
-        env_file=".env",
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None,
         extra="ignore",
         case_sensitive=False,
     )
@@ -193,7 +193,11 @@ class EmailValidationSettings(BaseSettings):
             return [str(x).strip() for x in v if str(x).strip()]
         return []
 
-    model_config = SettingsConfigDict(env_prefix="VALIDATION_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="VALIDATION_", 
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None, 
+        extra="ignore"
+    )
 
 
 class DynamicQuotaSettings(BaseSettings):
@@ -203,7 +207,11 @@ class DynamicQuotaSettings(BaseSettings):
     max_adjustments: int = Field(default=5, ge=1, description="Maximum automatic adjustments")
     cooldown_hours: int = Field(default=24, ge=1, description="Hours between automatic adjustments")
 
-    model_config = SettingsConfigDict(env_prefix="QUOTA_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="QUOTA_", 
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None, 
+        extra="ignore"
+    )
 
 
 class StripeSettings(BaseSettings):
@@ -276,7 +284,7 @@ class StripeSettings(BaseSettings):
         return v
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None,
         extra="ignore",
         case_sensitive=False
     )
@@ -321,7 +329,7 @@ class JWTSettings(BaseSettings):
     
     model_config = SettingsConfigDict(
         env_prefix="JWT_",
-        env_file=".env",
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None,
         extra="allow",
         populate_by_name=True,
     )
@@ -359,7 +367,11 @@ class APIDocumentationSettings(BaseSettings):
         description="API contact",
     )
 
-    model_config = SettingsConfigDict(env_prefix="DOCS_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="DOCS_", 
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None, 
+        extra="ignore"
+    )
 
 
 class MonitoringSettings(BaseSettings):
@@ -379,7 +391,11 @@ class MonitoringSettings(BaseSettings):
             raise ValueError(f"Log level must be one of {valid_levels}")
         return v.upper()
 
-    model_config = SettingsConfigDict(env_prefix="MONITORING_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="MONITORING_", 
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None, 
+        extra="ignore"
+    )
 
 
 class Settings(BaseSettings):
@@ -670,7 +686,7 @@ class Settings(BaseSettings):
 
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env" if os.getenv("ENVIRONMENT") != "production" else None,
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         case_sensitive=False,

@@ -13,6 +13,7 @@ import os
 import asyncio
 import logging
 from pydantic import BaseModel, EmailStr
+import os
 from dotenv import load_dotenv
 import time
 # ✅ AÑADIR: Rate limiting integrado con circuit breakers
@@ -25,7 +26,11 @@ from app.rate_limiting.advanced_rate_limiting import (
 )
 
 
-load_dotenv()
+if os.getenv("ENVIRONMENT", "development") != "production":
+    load_dotenv(override=False)
+    logger.info("📋 Loaded environment variables from .env file (development mode)")
+else:
+    logger.info("☁️ Running in production, using system environment variables")
 
 # Compat alias for historical typo in some libs
 setattr(_status, "HTTP_401_UNANAUTHORIZED", _status.HTTP_401_UNAUTHORIZED)
