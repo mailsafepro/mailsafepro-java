@@ -1266,6 +1266,18 @@ class DomainChecker:
 
                 logger.debug(f"[MX-DEBUG] ⚠️  Connection failed to {mx_host}: {connection_result.message}")
                 last_error = connection_result.message
+                
+                # OPTIMIZATION: Fail Fast on Infrastructure Blocks
+                if connection_result.message in ["timeout", "smtp_blocked_by_infra"]:
+                     logger.warning(f"🛑 Infrastructure block detected for {mx_host}. Aborting all MX checks.")
+                     # Return valid=True (DNS is good), but indicate we can't verify mailbox
+                     return VerificationResult(
+                        True,
+                        f"Infrastructure blocked SMTP check ({connection_result.message})",
+                        error_type="infra_block",
+                        mx_host=mx_host
+                     )
+                     
                 continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1307,6 +1319,13 @@ class DomainChecker:
                 )
                 if result and getattr(result, "success", None):
                     return result
+                
+                # OPTIMIZATION: Fail Fast on Infrastructure Blocks
+                # If the first port/attempt is blocked by infra (101) or dropped (timeout),
+                # it is extremely unlikely others will work. Abort to save time.
+                if result and result.message in ["timeout", "smtp_blocked_by_infra"]:
+                    logger.warning(f"🛑 Infrastructure block detected ({result.message}) on port {port}. Aborting other ports.")
+                    return result
             except Exception as e:
                 logger.debug(f"SMTP connection attempt failed for {mx_host}:{port} — {str(e)}")
                 continue
@@ -1324,32 +1343,32 @@ class DomainChecker:
         server: Optional[smtplib.SMTP] = None
         used_tls = False
         try:
-                # Banner Timeout Strategy: Fail fast on tarpits (5s)
-                banner_timeout = 5.0
-                if port == 465:
-                    ctx = self._build_ssl_context()
-                    server = smtplib.SMTP_SSL(timeout=banner_timeout, context=ctx)
-                    server.connect(mx_host, port)
-                    # Restoration of full timeout for conversation
-                    if server.sock:
-                        server.sock.settimeout(self.connection_timeout)
-                    server.ehlo()
-                    used_tls = True
-                else:
-                    server = smtplib.SMTP(timeout=banner_timeout)
-                    server.connect(mx_host, port)
-                    # Restoration of full timeout for conversation
-                    if server.sock:
-                        server.sock.settimeout(self.connection_timeout)
-                    server.ehlo_or_helo_if_needed()
-                    if config.smtp_use_tls and server.has_extn("starttls"):
-                        try:
-                            ctx = self._build_ssl_context()
-                            server.starttls(context=ctx)
-                            server.ehlo()
-                            used_tls = True
-                        except Exception as e:
-                            logger.debug(f"STARTTLS attempt failed for {mx_host}:{port} — {str(e)}")
+            # Banner Timeout Strategy: Fail fast on tarpits (5s)
+            banner_timeout = 5.0
+            if port == 465:
+                ctx = self._build_ssl_context()
+                server = smtplib.SMTP_SSL(timeout=banner_timeout, context=ctx)
+                server.connect(mx_host, port)
+                # Restoration of full timeout for conversation
+                if server.sock:
+                    server.sock.settimeout(self.connection_timeout)
+                server.ehlo()
+                used_tls = True
+            else:
+                server = smtplib.SMTP(timeout=banner_timeout)
+                server.connect(mx_host, port)
+                # Restoration of full timeout for conversation
+                if server.sock:
+                    server.sock.settimeout(self.connection_timeout)
+                server.ehlo_or_helo_if_needed()
+                if config.smtp_use_tls and server.has_extn("starttls"):
+                    try:
+                        ctx = self._build_ssl_context()
+                        server.starttls(context=ctx)
+                        server.ehlo()
+                        used_tls = True
+                    except Exception as e:
+                        logger.debug(f"STARTTLS attempt failed for {mx_host}:{port} — {str(e)}")
 
             sender = config.smtp_sender
             mail_options: List[str] = []
@@ -1367,6 +1386,9 @@ class DomainChecker:
                 used_tls=used_tls,
                 tested_ports=[port],
             )
+        except socket.timeout:
+            return SMTPTestResult(success=False, message="timeout", tested_ports=[port])
+        
         except smtplib.SMTPResponseException as e:
             response_text = SMTPChecker._parse_smtp_response_static(e.smtp_error)
             return SMTPTestResult(
@@ -1376,18 +1398,22 @@ class DomainChecker:
                 response_text=response_text,
                 tested_ports=[port],
             )
-        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
-            return SMTPTestResult(success=False, message=f"Connection error: {str(e)}", tested_ports=[port])
+
         except OSError as e:
-            # Handle "Network is unreachable" (Errno 101) common on Render free tier
+            # Handle "Network is unreachable" (Errno 101)
             if e.errno == 101 or "Network is unreachable" in str(e):
                 logger.warning(f"🚫 Outbound SMTP blocked by infrastructure for {mx_host}:{port} (Errno 101)")
                 return SMTPTestResult(success=False, message="smtp_blocked_by_infra", tested_ports=[port])
-            logger.error(f"OS Error during SMTP check for {mx_host}:{port} — {str(e)}")
-            return SMTPTestResult(success=False, message="os_error", tested_ports=[port])
+            # Other OS errors -> Retry
+            raise e
+
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected) as e:
+            # allow retry for connection errors
+            raise e
+
         except Exception as e:
-            logger.error(f"Unexpected SMTP error for {mx_host}:{port} — {str(e)}")
-            return SMTPTestResult(success=False, message="unexpected_error", tested_ports=[port])
+            logger.debug(f"Unexpected SMTP error for {mx_host}:{port} — {str(e)}")
+            raise e
         finally:
             try:
                 if server:
@@ -1589,7 +1615,12 @@ class SMTPChecker:
                             tested_ports=tested_ports,
                         )
 
-                except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
+                except socket.timeout:
+                    # Banner/Connect timeout -> Tarpit or Drop. Don't retry this port.
+                    logger.warning(f"⏳ SMTP Connection Timed Out (Tarpit/Drop) for {mx_host}:{port} > 5s. Skipping retries for this port.")
+                    break 
+
+                except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected) as e:
                     logger.debug("Transient SMTP error for %s:%d (attempt %d): %s", mx_host, port, attempt, str(e))
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, 8.0)
