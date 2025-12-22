@@ -1351,6 +1351,13 @@ class DomainChecker:
             )
         except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
             return SMTPTestResult(success=False, message=f"Connection error: {str(e)}", tested_ports=[port])
+        except OSError as e:
+            # Handle "Network is unreachable" (Errno 101) common on Render free tier
+            if e.errno == 101 or "Network is unreachable" in str(e):
+                logger.warning(f"🚫 Outbound SMTP blocked by infrastructure for {mx_host}:{port} (Errno 101)")
+                return SMTPTestResult(success=False, message="smtp_blocked_by_infra", tested_ports=[port])
+            logger.error(f"OS Error during SMTP check for {mx_host}:{port} — {str(e)}")
+            return SMTPTestResult(success=False, message="os_error", tested_ports=[port])
         except Exception as e:
             logger.error(f"Unexpected SMTP error for {mx_host}:{port} — {str(e)}")
             return SMTPTestResult(success=False, message="unexpected_error", tested_ports=[port])
@@ -1559,6 +1566,19 @@ class SMTPChecker:
                         response_text=response_text,
                         tested_ports=tested_ports,
                     )
+                except OSError as e:
+                    # Handle "Network is unreachable" (Errno 101) common on Render free tier
+                    if e.errno == 101 or "Network is unreachable" in str(e):
+                        logger.warning(f"🚫 Outbound SMTP blocked by infrastructure for {mx_host}:{port} (Errno 101) - Skipping retries")
+                        return SMTPTestResult(
+                            success=None, 
+                            message="smtp_blocked_by_provider", 
+                            tested_ports=tested_ports,
+                            response_text="SMTP traffic blocked by server provider"
+                        )
+                    logger.error(f"OS Error during SMTP check for {mx_host}:{port} — {str(e)}")
+                    # Don't retry on OS errors other than timeout (handled above)
+                    return SMTPTestResult(success=False, message="os_error", tested_ports=tested_ports)
                 except Exception as e:
                     logger.error(f"Unexpected SMTP error for {mx_host}:{port} — {str(e)}")
                     return SMTPTestResult(success=False, message="unexpected_error", tested_ports=tested_ports)
