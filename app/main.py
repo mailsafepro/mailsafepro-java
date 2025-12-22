@@ -317,44 +317,40 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         """Complete Redis initialization in background after app starts serving."""
         await asyncio.sleep(1)  # Give the server a moment to start accepting connections
         
-        # Retry Redis connection if not available
-        if not app.state.redis_available:
+        # Retry Redis connection loop
+        while not app.state.redis_available:
             redis_url = str(settings.redis_url)
-            # Log masked URL for debugging
             masked_url = redis_url[:15] + "..." + redis_url[-10:] if len(redis_url) > 30 else redis_url
-            logger.info(f"🔄 Retrying Redis connection in background | URL: {masked_url}")
+            logger.info(f"🔄 Attempting Redis connection in background | URL: {masked_url}")
             
             try:
+                # Try to connect with a shorter timeout per attempt, but loop
                 app.state.redis = await asyncio.wait_for(
                     initialize_redis_with_retry(redis_url),
-                    timeout=25.0  # Longer timeout for background retry
+                    timeout=10.0 
                 )
                 app.state.redis_available = True
                 logger.success("✅ Redis connected (background retry)")
                 
-                # Initialize ARQ now that Redis is available
+                # Initialize ARQ once Redis is available
                 try:
                     app.state.arq_redis = await asyncio.wait_for(
                         initialize_arq_with_retry(redis_url),
-                        timeout=10.0
+                        timeout=5.0
                     )
                     app.state.arq_available = True
                     logger.success("✅ ARQ pool initialized (background)")
                 except Exception as e:
-                    error_type = type(e).__name__
-                    logger.warning(f"⚠️ ARQ background init failed | Type: {error_type} | Error: {str(e) or repr(e)}")
-                    
-            except asyncio.TimeoutError:
-                logger.error("❌ Redis background retry timed out after 25s")
+                    logger.warning(f"⚠️ ARQ background init failed (non-critical): {e}")
+
+                # Break the loop if successful
+                break
+
             except Exception as e:
-                import traceback
-                error_type = type(e).__name__
-                error_msg = str(e) or repr(e)
-                logger.error(
-                    f"❌ Redis background retry failed | Type: {error_type} | "
-                    f"Error: {error_msg[:300]}"
-                )
-                logger.debug(f"Redis background retry traceback: {traceback.format_exc()}")
+                # Log error but keep looping after delay
+                logger.warning(f"⚠️ Redis background attempt failed: {str(e)[:100]}. Retrying in 5s...")
+                await asyncio.sleep(5)
+
         
         # Initialize services if Redis is available
         if app.state.redis:
