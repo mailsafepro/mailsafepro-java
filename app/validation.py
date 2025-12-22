@@ -1245,6 +1245,25 @@ class DomainChecker:
             else:
                 # Fallo de conexión, intentar siguiente MX
                 await smtp_circuit_breaker.record_failure(mx_host)
+                # Check if we were blocked by infrastructure (fail fast)
+                if connection_result.message == "smtp_blocked_by_provider":
+                    logger.warning(f"🚫 Infrastructure blocked SMTP for {mx_host}. Aborting all further MX checks for {domain}.")
+                    valid_mx = mx_host  # We consider it "found" in terms of resolution, but blocked
+                    # We can't really verify it, but we shouldn't waste time trying others
+                    # Return a special result or just break?
+                    # If we break here without setting valid_mx, it might fail domain check.
+                    # But we want to indicate "valid domain, but cant verify mailbox"
+                    # The outer logic handles 'unknown' or failures.
+                    
+                    # Optimization: Return immediately 
+                    return DomainCheckResult(
+                        valid=True, # The domain has MX records, so it is valid structure
+                        mx_host=mx_host, 
+                        mx_records=mx_records,
+                        is_catchall=None, # Cannot determine
+                        provider="unknown"
+                    )
+
                 logger.debug(f"[MX-DEBUG] ⚠️  Connection failed to {mx_host}: {connection_result.message}")
                 last_error = connection_result.message
                 continue
