@@ -180,7 +180,7 @@ class CacheWarmer:
             if not mx_records:
                 logger.bind(request_id="cache-warmer").warning(f"No MX records found for {domain}")
                 self._record_failure(domain)
-                return false
+                return False
             
             # Cache MX records with tier-specific TTL
             # Convert MXRecord objects to dicts to avoid serialization errors
@@ -207,7 +207,7 @@ class CacheWarmer:
         except Exception as e:
             logger.bind(request_id="cache-warmer").error(f"Failed to warm cache for {domain}: {e}")
             self._record_failure(domain)
-            return false
+            return False
     
     async def _warm_tier(
         self,

@@ -314,19 +314,16 @@ local remaining = limit - (current + cost)
 return {1, current + cost, limit, remaining, window}
 """
 
-        # ✅ TRY Redis with circuit breaker protection
+        # ✅ TRY Redis directly (circuit breaker is handled externally)
         try:
             now = time.time()
 
-            # Wrap in circuit breaker
-            @self.redis_breaker
-            async def check_redis():
-                return await self.redis.eval(
-                    lua_script, 1, key,
-                    str(now), str(window), str(limit), str(cost)
-                )
-
-            result = await check_redis()
+            # Direct Redis call without inline decorator (prevents recursion)
+            result = await self.redis.eval(
+                lua_script, 1, key,
+                str(now), str(window), str(limit), str(cost)
+            )
+            
             allowed = bool(result[0])
             current = int(result[1])
             limit_val = int(result[2])
