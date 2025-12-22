@@ -53,11 +53,11 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=mailsafepro:mailsafepro . .
 
 # Set environment variables
+# NOTE: PORT is NOT set here - Render assigns it dynamically via environment variable
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
-    PORT=8000
+    PYTHONPATH=/app
 
 # Create necessary directories with correct permissions
 RUN mkdir -p /app/logs /app/.cache && \
@@ -66,13 +66,13 @@ RUN mkdir -p /app/logs /app/.cache && \
 # Switch to non-root user
 USER mailsafepro
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+# Health check - uses PORT from environment or defaults to 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/healthcheck || exit 1
 
-# Expose port
-EXPOSE ${PORT}
+# Expose default port (Render overrides via PORT env var)
+EXPOSE 8000
 
-# Start application with uvicorn
-CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2
+# Start application with uvicorn - PORT is injected by Render, fallback to 8000 for local dev
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
 
