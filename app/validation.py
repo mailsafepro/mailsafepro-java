@@ -1324,24 +1324,32 @@ class DomainChecker:
         server: Optional[smtplib.SMTP] = None
         used_tls = False
         try:
-            if port == 465:
-                ctx = self._build_ssl_context()
-                server = smtplib.SMTP_SSL(timeout=self.connection_timeout, context=ctx)
-                server.connect(mx_host, port)
-                server.ehlo()
-                used_tls = True
-            else:
-                server = smtplib.SMTP(timeout=self.connection_timeout)
-                server.connect(mx_host, port)
-                server.ehlo_or_helo_if_needed()
-                if config.smtp_use_tls and server.has_extn("starttls"):
-                    try:
-                        ctx = self._build_ssl_context()
-                        server.starttls(context=ctx)
-                        server.ehlo()
-                        used_tls = True
-                    except Exception as e:
-                        logger.debug(f"STARTTLS attempt failed for {mx_host}:{port} — {str(e)}")
+                # Banner Timeout Strategy: Fail fast on tarpits (5s)
+                banner_timeout = 5.0
+                if port == 465:
+                    ctx = self._build_ssl_context()
+                    server = smtplib.SMTP_SSL(timeout=banner_timeout, context=ctx)
+                    server.connect(mx_host, port)
+                    # Restoration of full timeout for conversation
+                    if server.sock:
+                        server.sock.settimeout(self.connection_timeout)
+                    server.ehlo()
+                    used_tls = True
+                else:
+                    server = smtplib.SMTP(timeout=banner_timeout)
+                    server.connect(mx_host, port)
+                    # Restoration of full timeout for conversation
+                    if server.sock:
+                        server.sock.settimeout(self.connection_timeout)
+                    server.ehlo_or_helo_if_needed()
+                    if config.smtp_use_tls and server.has_extn("starttls"):
+                        try:
+                            ctx = self._build_ssl_context()
+                            server.starttls(context=ctx)
+                            server.ehlo()
+                            used_tls = True
+                        except Exception as e:
+                            logger.debug(f"STARTTLS attempt failed for {mx_host}:{port} — {str(e)}")
 
             sender = config.smtp_sender
             mail_options: List[str] = []
@@ -1513,17 +1521,27 @@ class SMTPChecker:
                 server = None
                 used_tls = False
                 try:
+                    # Banner Timeout Strategy: Fail fast on tarpits (5s)
+                    banner_timeout = 5.0
+                    
                     if port == 465:
                         ctx = self._build_ssl_context()
-                        server = smtplib.SMTP_SSL(timeout=self.timeout, context=ctx)
+                        server = smtplib.SMTP_SSL(timeout=banner_timeout, context=ctx)
                         server.connect(mx_host, port)
+                        # Connection successful, restore normal timeout for commands
+                        if server.sock:
+                            server.sock.settimeout(self.timeout)
                         server.ehlo()
                         used_tls = True
                     else:
-                        server = smtplib.SMTP(timeout=self.timeout)
+                        server = smtplib.SMTP(timeout=banner_timeout)
                         server.connect(mx_host, port)
+                        # Connection successful, restore normal timeout for commands
+                        if server.sock:
+                            server.sock.settimeout(self.timeout)
                         server.ehlo_or_helo_if_needed()
                         if server.has_extn("starttls") and getattr(settings, "smtp_use_tls", config.smtp_use_tls):
+
                             try:
                                 ctx = self._build_ssl_context()
                                 server.starttls(context=ctx)
