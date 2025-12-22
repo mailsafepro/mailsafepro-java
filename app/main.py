@@ -263,59 +263,95 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         yield
         return
 
+    # Initialize state immediately so healthchecks can respond
     app.state.redis = None
     app.state.arq_redis = None
     app.state.redis_available = False
     app.state.arq_available = False
 
-    # ✅ Aumentar timeout de 10s a 30s
+    # ✅ CRITICAL FIX: Use very short timeout (5s) so Render can detect the port quickly
+    # Redis connection will retry in background if it fails initially
     try:
         redis_url = str(settings.redis_url)
         app.state.redis = await asyncio.wait_for(
             initialize_redis_with_retry(redis_url),
-            timeout=30.0  # ← CAMBIAR de 10.0 a 30.0
+            timeout=5.0  # ← SHORT timeout for quick startup
         )
         app.state.redis_available = True
+        logger.success("✅ Redis connected during startup")
     except asyncio.TimeoutError:
-        logger.warning("⚠️ Redis initialization timeout after 30s - running without cache")
+        logger.warning("⚠️ Redis connection slow - will retry in background")
     except Exception as e:
-        logger.warning(f"⚠️ Redis initialization failed: {str(e)} - running in degraded mode")
+        logger.warning(f"⚠️ Redis initialization failed: {str(e)[:100]} - will retry in background")
 
-    # ✅ ARQ también con 30s
+    # ✅ ARQ with short timeout too
     if app.state.redis:
         try:
             redis_url = str(settings.redis_url)
             app.state.arq_redis = await asyncio.wait_for(
                 initialize_arq_with_retry(redis_url),
-                timeout=30.0  # ← CAMBIAR de 10.0 a 30.0
+                timeout=5.0  # ← SHORT timeout
             )
             app.state.arq_available = True
         except asyncio.TimeoutError:
-            logger.warning("⚠️ ARQ pool initialization timeout after 30s")
+            logger.warning("⚠️ ARQ pool timeout - will retry in background")
             service_health.labels(service='arq').set(0)
         except Exception as e:
-            logger.warning(f"⚠️ ARQ pool initialization failed: {e}")
+            logger.warning(f"⚠️ ARQ pool failed: {e}")
             service_health.labels(service='arq').set(0)
-
-    # ✅ Warm-up con 10s está bien
-    if app.state.redis:
-        try:
-            await asyncio.wait_for(warm_up_connections(app.state.redis), timeout=10.0)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"⚠️ Connection warm-up failed: {e}")
-
-    # ✅ Services con 20s
-    if app.state.redis:
-        try:
-            await asyncio.wait_for(initialize_services(app), timeout=20.0)  # ← 20s
-            service_health.labels(service='app').set(1)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"⚠️ Service initialization failed: {e}")
-            service_health.labels(service='app').set(0)
 
     startup_duration = time.time() - startup_start_time
     app_startup_duration.observe(startup_duration)
-    logger.success(f"✅ API server started successfully in {startup_duration:.2f}s")
+    logger.success(f"✅ API server started in {startup_duration:.2f}s (Redis: {app.state.redis_available})")
+
+    # ✅ Start background task to complete initialization after app is live
+    async def background_initialization():
+        """Complete Redis initialization in background after app starts serving."""
+        await asyncio.sleep(1)  # Give the server a moment to start accepting connections
+        
+        # Retry Redis connection if not available
+        if not app.state.redis_available:
+            logger.info("🔄 Retrying Redis connection in background...")
+            try:
+                redis_url = str(settings.redis_url)
+                app.state.redis = await asyncio.wait_for(
+                    initialize_redis_with_retry(redis_url),
+                    timeout=25.0  # Longer timeout for background retry
+                )
+                app.state.redis_available = True
+                logger.success("✅ Redis connected (background retry)")
+                
+                # Initialize ARQ now that Redis is available
+                try:
+                    app.state.arq_redis = await asyncio.wait_for(
+                        initialize_arq_with_retry(redis_url),
+                        timeout=10.0
+                    )
+                    app.state.arq_available = True
+                    logger.success("✅ ARQ pool initialized (background)")
+                except Exception as e:
+                    logger.warning(f"⚠️ ARQ background init failed: {e}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Redis background retry failed: {e}")
+        
+        # Initialize services if Redis is available
+        if app.state.redis:
+            try:
+                await asyncio.wait_for(warm_up_connections(app.state.redis), timeout=10.0)
+            except Exception as e:
+                logger.warning(f"⚠️ Connection warm-up failed: {e}")
+            
+            try:
+                await asyncio.wait_for(initialize_services(app), timeout=20.0)
+                service_health.labels(service='app').set(1)
+                logger.success("✅ Services initialized (background)")
+            except Exception as e:
+                logger.warning(f"⚠️ Service initialization failed: {e}")
+                service_health.labels(service='app').set(0)
+
+    # Start background initialization (non-blocking)
+    asyncio.create_task(background_initialization())
 
     try:
         yield
