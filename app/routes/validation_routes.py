@@ -2842,7 +2842,7 @@ async def validate_email_endpoint(
         # ============================================================
         try:
             timeout_seconds = {
-                "FREE": 8.0,      # 15 segundos para FREE
+                "FREE": 20.0,      # 20 segundos para FREE (increased for slow DNS on free tier)
                 "PREMIUM": 45.0,   # 45 segundos para PREMIUM
                 "ENTERPRISE": 60.0 # 60 segundos para ENTERPRISE
             }.get(plan_upper, 20.0)
