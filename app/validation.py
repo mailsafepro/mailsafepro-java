@@ -1448,10 +1448,15 @@ class SMTPChecker:
                 logger.error("Failed to obtain domain_result in synchronous SMTP check: %s", str(e))
                 return False, "Domain validation error"
 
-        if not getattr(domain_result, "valid", False) or not getattr(domain_result, "mx_host", None):
+        if not getattr(domain_result, "valid", False):
+            return False, "Invalid domain configuration"
+        
+        # ✅ Extrae mx_host y verifica explícitamente
+        mx_host = getattr(domain_result, "mx_host", None)
+        if not mx_host:  # ✅ Ahora Pyright sabe que después mx_host no es None
             return False, "Invalid domain configuration"
 
-        mx_host = domain_result.mx_host
+        # ✅ Aquí Pyright sabe que mx_host es str, no Optional[str]
         if not domain_validator.is_safe_mx_host(mx_host):
             return False, "Unsafe MX host"
 
@@ -1459,10 +1464,10 @@ class SMTPChecker:
         if getattr(smtp_result, "success", None) is True:
             return True, getattr(smtp_result, "response_text", getattr(smtp_result, "message", "Mailbox verified"))
         elif getattr(smtp_result, "response_code", None):
-            # 4xx/5xx se devuelven como False con el texto
             return False, getattr(smtp_result, "response_text", getattr(smtp_result, "message", "Mailbox verification failed"))
         else:
             return None, getattr(smtp_result, "message", "Unknown SMTP result")
+
 
     def _perform_smtp_check(self, email: str, mx_host: str, do_rcpt: bool) -> SMTPTestResult:
         if not SMTPChecker._smtp_host_allow_request(mx_host):
@@ -1629,11 +1634,17 @@ async def check_smtp_mailbox_safe(
         logger.error("SMTP wrapper unexpected error: %s", str(e))
         return None, f"SMTP error: {str(e)}"
 
-    if isinstance(result, tuple) and len(result) >= 2:
-        return result[0], result[1]
-    if hasattr(result, "success"):
-        return result.success, getattr(result, "response_text", getattr(result, "message", ""))
-    return None, "Unknown result"
+    # ✅ MEJOR: Usar else para type narrowing
+    if isinstance(result, tuple):
+        if len(result) >= 2:
+            return result[0], result[1]
+        return None, "Invalid tuple result"
+    else:
+        # Aquí Pyright sabe que result NO es tuple
+        if hasattr(result, "success"):
+            return result.success, getattr(result, "response_text", getattr(result, "message", ""))
+        return None, "Unknown result"
+
 
 
 # ---------------------------
@@ -1800,7 +1811,7 @@ async def get_cache_stats() -> Dict[str, Any]:
             return {
                 "redis_enabled": True,
                 "mx_keys": mx_count,
-                "mx_cache_size": await mx_cache.size() if hasattr(mx_cache, "size") else "N/A",
+                "mx_cache_size": await mx_cache.maxsize() if hasattr(mx_cache, "size") else "N/A",
             }
         except Exception:
             pass

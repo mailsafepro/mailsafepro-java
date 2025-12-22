@@ -169,18 +169,18 @@ class CacheWarmer:
         """Warm cache for a single domain."""
         try:
             if self._should_skip_domain(domain):
-                logger.debug(f"Skipping domain {domain} due to repeated failures")
+                logger.bind(request_id="cache-warmer").debug(f"Skipping domain {domain} due to repeated failures")
                 return False
             
-            logger.debug(f"Warming cache for domain: {domain}")
+            logger.bind(request_id="cache-warmer").debug(f"Warming cache for domain: {domain}")
             
             # Fetch MX records
             mx_records = await get_mx_records(domain, max_records=5)
             
             if not mx_records:
-                logger.warning(f"No MX records found for {domain}")
+                logger.bind(request_id="cache-warmer").warning(f"No MX records found for {domain}")
                 self._record_failure(domain)
-                return False
+                return false
             
             # Cache MX records with tier-specific TTL
             # Convert MXRecord objects to dicts to avoid serialization errors
@@ -198,16 +198,16 @@ class CacheWarmer:
                     txt_cache_key = UnifiedCache.build_key("txt", domain)
                     await async_cache_set(txt_cache_key, spf_records, ttl=ttl)
             except Exception as e:
-                logger.debug(f"SPF warming failed for {domain}: {e}")
+                logger.bind(request_id="cache-warmer").debug(f"SPF warming failed for {domain}: {e}")
             
             self.stats["total_warmed"] += 1
-            logger.info(f"✅ Warmed cache for {domain} (TTL: {ttl}s)")
+            logger.bind(request_id="cache-warmer").info(f"✅ Warmed cache for {domain} (TTL: {ttl}s)")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to warm cache for {domain}: {e}")
+            logger.bind(request_id="cache-warmer").error(f"Failed to warm cache for {domain}: {e}")
             self._record_failure(domain)
-            return False
+            return false
     
     async def _warm_tier(
         self,
@@ -266,14 +266,14 @@ class CacheWarmer:
         self._last_warming[tier] = datetime.utcnow()
         
         success_count = sum(1 for v in results.values() if v)
-        logger.info(f"✅ Tier {tier} warming complete: {success_count}/{len(domains)} successful")
+        logger.bind(request_id="cache-warmer").info(f"✅ Tier {tier} warming complete: {success_count}/{len(domains)} successful")
         
         return results
     
     async def warm_all_tiers(self, force: bool = False) -> None:
         """Warm cache for all tiers."""
         start_time = datetime.utcnow()
-        logger.info("🚀 Starting cache warming for all tiers")
+        logger.bind(request_id="cache-warmer").info("🚀 Starting cache warming for all tiers")
         
         # Warm in parallel by tier (each tier has its own semaphore)
         await asyncio.gather(
@@ -286,31 +286,28 @@ class CacheWarmer:
         duration = (datetime.utcnow() - start_time).total_seconds()
         self.stats["last_run"] = start_time.isoformat()
         
-        logger.info(
-            f"✅ Cache warming complete in {duration:.2f}s | "
-            f"Total warmed: {self.stats['total_warmed']} | "
-            f"Failures: {self.stats['total_failures']}"
-        )
+        logger.bind(request_id="cache-warmer").info(f"✅ Cache warming completed in {duration:.1f}s")
+        logger.bind(request_id="cache-warmer").info(f"📊 Stats: Total warmed: {self.stats['total_warmed']} | Failures: {self.stats['total_failures']}")
     
     async def start_background_warming(self) -> None:
         """Start background task that periodically warms cache."""
         if self._running:
-            logger.warning("Cache warmer already running")
+            logger.bind(request_id="cache-warmer").warning("Cache warmer already running")
             return
         
         if not self.config.enabled:
-            logger.info("Cache warming disabled in configuration")
+            logger.bind(request_id="cache-warmer").info("Cache warming disabled in configuration")
             return
         
         self._running = True
-        logger.info("🔥 Starting background cache warming")
+        logger.bind(request_id="cache-warmer").info("🔥 Starting background cache warming")
         
         async def _warming_loop():
             # Initial warm on startup
             try:
                 await self.warm_all_tiers(force=True)
             except Exception as e:
-                logger.error(f"Initial cache warming failed: {e}")
+                logger.bind(request_id="cache-warmer").error(f"Initial cache warming failed: {e}")
             
             # Continuous warming loop
             while self._running:
@@ -320,18 +317,18 @@ class CacheWarmer:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"Cache warming loop error: {e}")
+                    logger.bind(request_id="cache-warmer").error(f"Cache warming loop error: {e}")
                     await asyncio.sleep(300)  # Wait 5min on error
         
         self._task = asyncio.create_task(_warming_loop())
-        logger.info("✅ Background cache warming started")
+        logger.bind(request_id="cache-warmer").info("✅ Background cache warming started")
     
     async def stop(self) -> None:
         """Stop background warming."""
         if not self._running:
             return
         
-        logger.info("Stopping background cache warming")
+        logger.bind(request_id="cache-warmer").info("Stopping background cache warming")
         self._running = False
         
         if self._task:
@@ -341,7 +338,7 @@ class CacheWarmer:
             except asyncio.CancelledError:
                 pass
         
-        logger.info("✅ Background cache warming stopped")
+        logger.bind(request_id="cache-warmer").info("✅ Background cache warming stopped")
     
     def get_stats(self) -> Dict:
         """Get warming statistics."""

@@ -319,12 +319,12 @@ async def get_user_plan_safe(request: Request, redis: Redis) -> str:
 # ------------------------------
 
 def check_smtp_mailbox(email: str) -> Tuple[bool, str]:
-    from app.validation import check_smtp_mailbox as _check
+    from app.validation import check_smtp_mailbox_safe as _check
     return _check(email)
 
 
 def check_domain(email: str) -> VerificationResult:
-    from app.validation import check_domain as _check
+    from app.validation import check_domain_sync as _check
     return _check(email)
 
 

@@ -355,7 +355,7 @@ class WHOISCircuitBreaker:
             self.failures[ip] += 1
             if self.failures[ip] >= config.whois_failure_threshold:
                 self.blocked_until[ip] = time.time() + config.whois_block_seconds
-                logger.warning(f"WHOIS: IP {ip} blocked until {self.blocked_until[ip]} due to {self.failures[ip]} failures")
+                logger.bind(request_id="whois").warning(f"WHOIS: IP {ip} blocked until {self.blocked_until[ip]} due to {self.failures[ip]} failures")
 
 WHOIS_CB = WHOISCircuitBreaker()
 WHOIS_SEMAPHORE: Optional[asyncio.Semaphore] = None
@@ -632,7 +632,7 @@ async def resolve_mx_to_ip(mx_host: str) -> Optional[str]:
             await async_cache_set(cache_key, chosen, ttl=config.ip_cache_ttl)
         return chosen
     except Exception as e:
-        logger.debug(f"DNS resolution failed for {mx_host}: {str(e)}")
+        logger.bind(request_id="dns").debug(f"DNS resolution failed for {mx_host}: {str(e)}")
         MET_DNS_FAILURES.inc()
         return None
 
@@ -662,7 +662,7 @@ async def whois_operation(ip: str):
         yield None
         return
     if await WHOIS_CB.is_blocked(ip):
-        logger.debug(f"WHOIS blocked for {ip} by circuit breaker")
+        logger.bind(request_id="whois").debug(f"WHOIS blocked for {ip} by circuit breaker")
         MET_WHOIS_BLOCKED.inc()
         yield None
         return
@@ -673,12 +673,12 @@ async def whois_operation(ip: str):
             result = await asyncio.wait_for(async_retry(_whois_call, ip, attempts=3, on_retry=lambda e, a: None), timeout=config.whois_timeout)
             yield result
         except asyncio.TimeoutError:
-            logger.warning(f"WHOIS timeout for {ip}")
+            logger.bind(request_id="whois").warning(f"WHOIS timeout for {ip}")
             await WHOIS_CB.record_failure(ip)
             MET_WHOIS_FAILURES.inc()
             yield None
         except Exception as e:
-            logger.warning(f"WHOIS error for {ip}: {str(e)}")
+            logger.bind(request_id="whois").warning(f"WHOIS error for {ip}: {str(e)}")
             await WHOIS_CB.record_failure(ip)
             MET_WHOIS_FAILURES.inc()
             yield None
@@ -730,8 +730,8 @@ async def check_spf(domain: str) -> str:
         # ✅ CRÍTICO: Crear resolver con nameservers configurados
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-        resolver.timeout = 3.0  # ← 3 segundos (antes: sin configurar)
-        resolver.lifetime = 5.0  # ← Máximo 5 segundos total
+        resolver.timeout = 5.0  # ← 5 segundos (antes: sin configurar)
+        resolver.lifetime = 8.0  # ← Máximo 8 segundos total
         
         # ✅ Usar asyncio.to_thread con el resolver configurado
         answers = await asyncio.to_thread(
@@ -746,28 +746,41 @@ async def check_spf(domain: str) -> str:
                 for txt_string in rdata.strings:
                     txt_str = txt_string.decode('utf-8', errors='ignore').strip()
                     if txt_str.startswith('v=spf1'):
-                        logger.info(f"✅ SPF Found for {name}: {txt_str[:80]}...")
+                        logger.bind(request_id="spf").info(f"✅ SPF Found for {name}: {txt_str[:80]}...")
                         return txt_str
         
-        logger.debug(f"SPF not found for {name}")
+        logger.bind(request_id="spf").debug(f"SPF not found for {name}")
         return "no-spf"
         
     except dns.resolver.NXDOMAIN:
-        logger.debug(f"Domain {name} does not exist (NXDOMAIN)")
+        logger.bind(request_id="spf").debug(f"Domain {name} does not exist (NXDOMAIN)")
         return "no-spf"
     except dns.resolver.NoAnswer:
-        logger.debug(f"No TXT records for {name}")
+        logger.bind(request_id="spf").debug(f"No TXT records for {name}")
         return "no-spf"
     except dns.exception.Timeout:
-        logger.warning(f"⏱️ SPF DNS timeout for {name} after 5s")
+        logger.bind(request_id="spf").warning(f"⏱️ SPF DNS timeout for {name} after 5s")
         return "timeout"  # ← Distinguir timeout de not_found
     except asyncio.TimeoutError:
-        logger.warning(f"⏱️ SPF asyncio timeout for {name}")
+        logger.bind(request_id="spf").warning(f"⏱️ SPF asyncio timeout for {name}")
         return "timeout"
     except Exception as e:
-        logger.warning(f"SPF check error for {name}: {str(e)}")
+        logger.bind(request_id="spf").warning(f"SPF check error for {name}: {str(e)}")
         return "error"
 
+async def check_spf_with_retry(domain: str, retries: int = 2) -> str:
+    """SPF con reintentos automáticos."""
+    for attempt in range(retries):
+        try:
+            result = await check_spf(domain)
+            if result not in ["timeout", "error"]:
+                return result
+            if attempt < retries - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception:
+            if attempt == retries - 1:
+                return "error"
+    return "no-spf"
 
 async def check_dmarc(domain: str) -> str:
     """Búsqueda DMARC robusta con nameservers configurados."""
@@ -781,8 +794,8 @@ async def check_dmarc(domain: str) -> str:
         # ✅ CRÍTICO: Crear resolver con nameservers configurados
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
-        resolver.timeout = 3.0
-        resolver.lifetime = 5.0
+        resolver.timeout = 5.0
+        resolver.lifetime = 8.0
         
         qname = f"_dmarc.{d}"
         
@@ -799,24 +812,26 @@ async def check_dmarc(domain: str) -> str:
                 for txt_string in rdata.strings:
                     txt_str = txt_string.decode('utf-8', errors='ignore').strip()
                     if txt_str.lower().startswith("v=dmarc1"):
-                        logger.info(f"✅ DMARC Found for {d}: {txt_str[:80]}...")
+                        logger.bind(request_id="dmarc").info(f"✅ DMARC Found for {d}: {txt_str[:80]}...")
                         return txt_str
         
-        logger.debug(f"DMARC not found for _dmarc.{d}")
+        logger.bind(request_id="dmarc").debug(f"DMARC not found for _dmarc.{d}")
         return "no-dmarc"
         
     except dns.resolver.NXDOMAIN:
+        logger.bind(request_id="dmarc").debug(f"DMARC NXDOMAIN for _dmarc.{d}")
         return "no-dmarc"
     except dns.resolver.NoAnswer:
+        logger.bind(request_id="dmarc").debug(f"No DMARC records for _dmarc.{d}")
         return "no-dmarc"
     except dns.exception.Timeout:
-        logger.warning(f"⏱️ DMARC DNS timeout for _dmarc.{d} after 5s")
+        logger.bind(request_id="dmarc").warning(f"⏱️ DMARC DNS timeout for _dmarc.{d} after 5s")
         return "timeout"
     except asyncio.TimeoutError:
-        logger.warning(f"⏱️ DMARC asyncio timeout for _dmarc.{d}")
+        logger.bind(request_id="dmarc").warning(f"⏱️ DMARC asyncio timeout for _dmarc.{d}")
         return "timeout"
     except Exception as e:
-        logger.warning(f"DMARC check error for {d}: {str(e)}")
+        logger.bind(request_id="dmarc").warning(f"DMARC check error for {d}: {str(e)}")
         return "error"
 
 
@@ -1122,42 +1137,40 @@ async def enhanced_dkim_check(domain: str) -> DKIMInfo:
         "k1", "k2", "mail", "dkim",
         # Sendgrid, AWS SES
         "amazonses",
-        "sendgrid",
+        "sendgrid"
     ]
     
     for selector in selectors:
         try:
             qname = f"{selector}._domainkey.{d}"
-            logger.debug(f"[DKIM] Trying selector '{selector}' for {d}: {qname}")
+            logger.bind(request_id="dkim").debug(f"Trying selector '{selector}' for {d}: {qname}")
             
             # ✅ Usar dns.resolver.resolve (bloqueante en thread)
             answers = await asyncio.to_thread(
-                dns.resolver.resolve,
-                qname,
+                dns.resolver.resolve, 
+                qname, 
                 dns.rdatatype.TXT,
                 raise_on_no_answer=False
             )
             
-            if answers:
-                for rdata in answers:
-                    # Unir todos los chunks del registro TXT en un solo string
-                    txt_str = b''.join(rdata.strings).decode('utf-8', errors='ignore').strip()
-                    
-                    # Solo procesar si parece un registro DKIM
-                    if 'v=dkim1' in txt_str.lower():
-                        # ✅ Encontrado: parsear e informar
-                        info = extract_dkim_parts(txt_str)
-                        info.selector = selector
-                        info.status = "valid"
-                        info.record = txt_str
-                        logger.info(f"[DKIM] Found for {d} with selector '{selector}'")
-                        return info
-        
+            for rdata in answers:
+                # Unir todos los chunks del registro TXT en un solo string
+                txt_str = b''.join(rdata.strings).decode('utf-8', errors='ignore').strip()
+                
+                # Solo procesar si parece un registro DKIM
+                if 'v=dkim1' in txt_str.lower():
+                    # ✅ Encontrado: parsear e informar
+                    info = extract_dkim_parts(txt_str)
+                    info.selector = selector
+                    info.status = "valid"
+                    info.record = txt_str
+                    logger.bind(request_id="dkim").info(f"Found for {d} with selector '{selector}'")
+                    return info
         except (dns.exception.DNSException, Exception) as e:
-            logger.debug(f"[DKIM] Selector '{selector}' failed: {str(e)[:100]}")
+            logger.bind(request_id="dkim").debug(f"Selector '{selector}' failed: {str(e)[:100]}")
             continue
     
-    logger.debug(f"[DKIM] No selectors found for {d}")
+    logger.bind(request_id="dkim").debug(f"No selectors found for {d}")
     return DKIMInfo(
         status="not_found",
         record=None,
@@ -1264,11 +1277,11 @@ async def analyze_email_provider(
         return result
         
     except asyncio.TimeoutError:
-        logger.warning(f"Provider analysis timeout for {email} after {timeout}s")
+        logger.bind(request_id="provider-analysis").warning(f"Provider analysis timeout for {email} after {timeout}s")
         
-        # ✅ FALLBACK INTELIGENTE: Retorna análisis básico válido
+        # FALLBACK INTELIGENTE: Retorna análisis básico válido
         return ProviderAnalysis(
-            domain=domain,
+            domain=domain or "unknown",
             primary_mx=None,
             ip=None,
             asn_info=None,
@@ -1286,7 +1299,7 @@ async def analyze_email_provider(
         )
     
     except Exception as e:
-        logger.error(f"Provider analysis failed for {email}: {str(e)}", exc_info=True)
+        logger.bind(request_id="provider-analysis").error(f"Provider analysis failed for {email}: {str(e)}", exc_info=True)
         
         return ProviderAnalysis(
             domain=domain or "unknown",
@@ -1375,36 +1388,36 @@ async def _analyze_provider_internal(email: str, domain: str) -> ProviderAnalysi
         try:
             # ✅ TIMEOUT 6 SEGUNDOS (antes: 3.0s)
             spf, dkim_info, dmarc = await asyncio.gather(
-                asyncio.wait_for(check_spf(domain), timeout=6.0),
-                asyncio.wait_for(check_dkim(domain), timeout=6.0),
-                asyncio.wait_for(check_dmarc(domain), timeout=6.0),
+                asyncio.wait_for(check_spf(domain), timeout=10.0),
+                asyncio.wait_for(check_dkim(domain), timeout=10.0),
+                asyncio.wait_for(check_dmarc(domain), timeout=10.0),
                 return_exceptions=True
             )
             
             # ✅ MANEJO ROBUSTO: Convertir timeout exceptions y validar timeouts
             if isinstance(spf, asyncio.TimeoutError) or spf == "timeout":
                 spf = "timeout"
-                logger.warning(f"SPF check timeout for {domain}")
+                logger.bind(request_id="provider-analysis").warning(f"SPF check timeout for {domain}")
             elif isinstance(spf, Exception):
                 spf = "error"
-                logger.warning(f"SPF check failed for {domain}: {str(spf)}")
-            
+                logger.bind(request_id="provider-analysis").warning(f"SPF check failed for {domain}: {str(spf)}")
+
             if isinstance(dmarc, asyncio.TimeoutError) or dmarc == "timeout":
                 dmarc = "timeout"
-                logger.warning(f"DMARC check timeout for {domain}")
+                logger.bind(request_id="provider-analysis").warning(f"DMARC check timeout for {domain}")
             elif isinstance(dmarc, Exception):
                 dmarc = "error"
-                logger.warning(f"DMARC check failed for {domain}: {str(dmarc)}")
+                logger.bind(request_id="provider-analysis").warning(f"DMARC check failed for {domain}: {str(dmarc)}")
                 
             if isinstance(dkim_info, asyncio.TimeoutError):
                 dkim_info = DKIMInfo(status="timeout", record=None, selector=None, key_type=None, key_length=None)
-                logger.warning(f"DKIM check timeout for {domain}")
+                logger.bind(request_id="provider-analysis").warning(f"DKIM check timeout for {domain}")
             elif isinstance(dkim_info, Exception):
                 dkim_info = DKIMInfo(status="error", record=None, selector=None, key_type=None, key_length=None)
-                logger.warning(f"DKIM check failed for {domain}: {str(dkim_info)}")
+                logger.bind(request_id="provider-analysis").warning(f"DKIM check failed for {domain}: {str(dkim_info)}")
                 
         except Exception as e:
-            logger.warning(f"DNS checks failed for {domain}: {str(e)}")
+            logger.bind(request_id="provider-analysis").warning(f"DNS checks failed for {domain}: {str(e)}")
             spf = "error"
             dkim_info = DKIMInfo(status="error", record=None, selector=None, key_type=None, key_length=None)
             dmarc = "error"

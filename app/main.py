@@ -380,7 +380,7 @@ async def warm_up_connections(redis: Redis):
     - Pre-caching DNS for common email domains
     - Establishing initial HTTP connections
     """
-    logger.info("🔥 Warming up connection pools...")
+    logger.bind(request_id="startup").info("🔥 Warming up connection pools...")
 
     try:
         # 1. Redis connection warm-up (10 parallel pings)
@@ -388,7 +388,7 @@ async def warm_up_connections(redis: Redis):
             *[redis.ping() for _ in range(10)],
             return_exceptions=True
         )
-        logger.debug("✅ Redis pool warmed (10 connections)")
+        logger.bind(request_id="startup").debug("✅ Redis pool warmed (10 connections)")
         redis_pool_connections.set(10)
 
         # 2. DNS resolver warm-up (common domains)
@@ -405,12 +405,12 @@ async def warm_up_connections(redis: Redis):
                 *[resolver.query(domain, "MX") for domain in warm_domains],
                 return_exceptions=True
             )
-            logger.debug(f"✅ DNS cache warmed ({len(warm_domains)} domains)")
+            logger.bind(request_id="startup").debug(f"✅ DNS cache warmed ({len(warm_domains)} domains)")
 
         except Exception as e:
-            logger.warning(f"DNS warm-up failed: {e}")
+            logger.bind(request_id="startup").warning(f"DNS warm-up failed: {e}")
 
-        logger.success("✅ Connection pools warmed up")
+        logger.bind(request_id="startup").success("✅ Connection pools warmed up")
 
     except Exception as e:
         logger.warning(f"⚠️ Connection warming failed: {e} - continuing anyway")
@@ -424,38 +424,38 @@ async def initialize_services(app: FastAPI):
     from app.validation import set_redis_client
     from app.health_checks import get_health_manager
 
-    logger.info("🔧 Initializing application services...")
+    logger.bind(request_id="startup").info("🔧 Initializing application services...")
 
     try:
         # Inject Redis client into validation layer for distributed caching
         set_redis_client(app.state.redis)
-        logger.info("✅ Redis client injected into validation layer")
+        logger.bind(request_id="startup").info("✅ Redis client injected into validation layer")
         
         # ✅ FIX: Configurar Redis en el health manager para health checks
         if app.state.redis:
             get_health_manager().set_redis(app.state.redis)
-            logger.info("✅ Redis client configured in health manager")
+            logger.bind(request_id="startup").info("✅ Redis client configured in health manager")
 
         # Cache disposable domains for fast lookup
         await cache_disposable_domains(app.state.redis)
 
         # Start background cache warming for popular domains
         try:
-            logger.info("🔥 Starting cache warming for popular email domains...")
+            logger.bind(request_id="startup").info("🔥 Starting cache warming for popular email domains...")
             await start_cache_warming()
-            logger.success("✅ Cache warming initialized successfully")
+            logger.bind(request_id="startup").success("✅ Cache warming initialized successfully")
             service_health.labels(service='cache_warming').set(1)
 
         except Exception as e:
-            logger.warning(f"⚠️ Cache warming initialization failed: {e}")
+            logger.bind(request_id="startup").warning(f"⚠️ Cache warming initialization failed: {e}")
             service_health.labels(service='cache_warming').set(0)
 
         # Start general background tasks
         asyncio.create_task(background_tasks())
-        logger.success("✅ Background tasks started")
+        logger.bind(request_id="startup").success("✅ Background tasks started")
 
     except Exception as e:
-        logger.error(f"❌ Service initialization failed: {e}")
+        logger.bind(request_id="startup").error(f"Failed to initialize services: {e}")
         raise
 
 
@@ -465,25 +465,25 @@ async def shutdown_services(app: FastAPI):
     """
     from app.cache_warming import stop_cache_warming
 
-    logger.info("🔧 Shutting down services...")
+    logger.bind(request_id="shutdown").info("🔧 Shutting down services...")
 
     shutdown_tasks = []
 
     try:
         # Stop cache warming background task
-        logger.info("Stopping cache warming...")
+        logger.bind(request_id="shutdown").info("Stopping cache warming...")
         shutdown_tasks.append(asyncio.create_task(stop_cache_warming()))
 
     except Exception as e:
-        logger.error(f"Error stopping cache warming: {e}")
+        logger.bind(request_id="shutdown").error(f"Error stopping cache warming: {e}")
 
     try:
         # Shutdown distributed tracing (flush remaining spans)
-        logger.info("Shutting down tracing...")
+        logger.bind(request_id="shutdown").info("Shutting down tracing...")
         shutdown_tracing()
 
     except Exception as e:
-        logger.error(f"Error shutting down tracing: {e}")
+        logger.bind(request_id="shutdown").error(f"Error shutting down tracing: {e}")
 
     # Wait for all shutdown tasks with timeout
     if shutdown_tasks:
@@ -493,9 +493,9 @@ async def shutdown_services(app: FastAPI):
                 timeout=10.0
             )
         except asyncio.TimeoutError:
-            logger.warning("⚠️ Service shutdown timeout exceeded")
+            logger.bind(request_id="shutdown").warning("⚠️ Service shutdown timeout exceeded")
 
-    logger.success("✅ All services shut down cleanly")
+    logger.bind(request_id="shutdown").success("✅ All services shut down cleanly")
 
 
 async def cache_disposable_domains(redis: Redis):
@@ -505,10 +505,12 @@ async def cache_disposable_domains(redis: Redis):
 
         if settings.validation.disposable_domains:
             await redis.sadd("disposable_domains", *settings.validation.disposable_domains)
-            logger.info(f"📦 Cached {len(settings.validation.disposable_domains)} disposable domains")
+            logger.bind(request_id="startup").info(f"📦 Cached {len(settings.validation.disposable_domains)} disposable domains")
 
+        return True
     except Exception as e:
-        logger.error(f"Failed to cache disposable domains: {str(e)}")
+        logger.bind(request_id="startup").error(f"Failed to cache disposable domains: {e}")
+        return False
 
 
 async def background_tasks():

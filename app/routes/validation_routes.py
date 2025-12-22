@@ -242,7 +242,7 @@ class ValidationService:
                 "used": current_usage,
             }
         except Exception as e:
-            logger.error(f"Rate limit check failed: {e}")
+            logger.bind(request_id="rate-limit").error(f"Rate limit check failed: {e}")
             return {"allowed": True, "remaining": float("inf"), "limit": None, "used": 0}
 
     async def _get_redis_int(self, redis, key: str, default: int = 0) -> int:
@@ -330,7 +330,7 @@ class ResponseBuilder:
             reputation = float(reputation) if reputation is not None else 0.5
             reputation = max(0.0, min(1.0, reputation))
         except (ValueError, TypeError, AttributeError):
-            logger.debug(f"Invalid reputation value {reputation}")
+            logger.bind(request_id="reputation").debug(f"Invalid reputation value {reputation}")
             reputation = 0.5
 
         # VALIDAR risk_score
@@ -418,7 +418,7 @@ class ResponseBuilder:
             elif is_role_email:
                 # Role emails son riesgosos independientemente del risk_score
                 email_status = "risky"
-                logger.debug(f"Status forced to 'risky' due to role email detection")
+                logger.bind(request_id=validation_id or "role-email").debug("Status forced to 'risky' due to role email detection")
             
             # 🔹 PRIORIDAD 3: Alto riesgo
             elif risk_score >= 0.7:
@@ -564,12 +564,30 @@ class ResponseBuilder:
         smtp_checked: bool,
         mailbox_exists: Optional[bool],
         is_spam_trap: bool = False,  # ← NUEVO parámetro
-        spam_trap_confidence: float = 0.0,  # ← NUEVO parámetro
+        spam_trap_confidence: float = 0.0,
+        provider: str = None  # ← NUEVO parámetro
     ) -> float:
         """
         Calcula puntuación de riesgo - MANEJO ROBUSTO DE TIPOS.
         Ahora incluye detección de spam traps.
         """
+
+        known_providers = ["gmail", "google", "outlook", "microsoft", "yahoo", "aol"]
+    
+        if provider and provider.lower() in known_providers:
+            # Gmail/Outlook siempre tienen riesgo bajo
+            base_score = 0.1  # ← Muy bajo en vez de 1.0 - reputation
+            
+            # Ajustes mínimos por otros factores
+            if not valid:
+                base_score += 0.3
+            if is_spam_trap and spam_trap_confidence > 0.7:
+                base_score += 0.5
+            if smtp_checked and mailbox_exists is False:
+                base_score += 0.3
+                
+            return min(1.0, base_score)
+
         # Si es spam trap con alta confianza, retornar riesgo máximo
         if is_spam_trap and spam_trap_confidence > 0.7:
             return 1.0
@@ -719,7 +737,7 @@ class EmailValidationEngine:
                 if plan:
                     return plan.upper()
         except Exception as e:
-            logger.debug(f"Could not extract plan: {e}")
+            logger.bind(request_id="plan-extraction").debug(f"Could not extract plan: {e}")
         return "UNKNOWN"
 
     async def perform_comprehensive_validation(
@@ -843,7 +861,7 @@ class EmailValidationEngine:
             from app.providers import is_disposable_email
             
             if is_disposable_email(email_normalized):
-                logger.warning(f"Disposable email detected: {email_normalized}")
+                logger.bind(request_id="disposable-check").warning(f"Disposable email detected: {email_normalized}")
                 # ✅ 200: Email procesable pero es disposable
                 return await ResponseBuilder.build_validation_response(
                     email=email_normalized,
@@ -875,8 +893,8 @@ class EmailValidationEngine:
                     "confidence": round(confidence, 2),
                     "reason": "Possible typo detected in domain"
                 }
-                logger.warning(
-                    f"{validation_id} | Typo detected: {email_normalized} → {suggested_email} "
+                logger.bind(request_id=validation_id).warning(
+                    f"Typo detected: {email_normalized} → {suggested_email} "
                     f"(confidence: {confidence*100.0:.0f}%)"
                 )
                 
@@ -902,11 +920,11 @@ class EmailValidationEngine:
             try:
                 from app.providers import SpamTrapDetector
                 
-                logger.info(f"{validation_id} | Checking spam traps...")
+                logger.bind(request_id=validation_id).info("Checking spam traps...")
                 spam_trap_check = await SpamTrapDetector.is_spam_trap(email_normalized)
                 
-                logger.info(
-                    f"{validation_id} | Spam trap check completed | "
+                logger.bind(request_id=validation_id).info(
+                    f"Spam trap check completed | "
                     f"is_trap={spam_trap_check['is_spam_trap']}, "
                     f"confidence={spam_trap_check['confidence']}, "
                     f"type={spam_trap_check['trap_type']}"
@@ -916,8 +934,8 @@ class EmailValidationEngine:
                 HIGH_TRAP_THRESHOLD = 0.9  # umbral de bloqueo duro
                 
                 if spam_trap_check["is_spam_trap"] and spam_trap_check["confidence"] >= HIGH_TRAP_THRESHOLD:
-                    logger.warning(
-                        f"{validation_id} | SPAM TRAP DETECTED | Email: {email_normalized} | "
+                    logger.bind(request_id=validation_id).warning(
+                        f"SPAM TRAP DETECTED | Email: {email_normalized} | "
                         f"Type: {spam_trap_check['trap_type']} | Confidence: {spam_trap_check['confidence']}"
                     )
                     
@@ -937,7 +955,7 @@ class EmailValidationEngine:
                     )
             
             except Exception as e:
-                logger.warning(f"Error en detección de spam trap: {e}")
+                logger.bind(request_id=validation_id).warning(f"Error en detección de spam trap: {e}")
                 spam_trap_check = None
             
             # ============================================================
@@ -954,97 +972,29 @@ class EmailValidationEngine:
                         ),
                         timeout=12,
                     )
-                    logger.info(
-                        f"[{validation_id}] HIBP check complete | "
+                    logger.bind(request_id=validation_id).info(
+                        f"HIBP check complete | "
                         f"In breach: {breach_info.get('in_breach')} | "
                         f"Count: {breach_info.get('breach_count')}"
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"[{validation_id}] HIBP timeout")
+                    logger.bind(request_id=validation_id).warning("HIBP timeout")
                     breach_info = None
                 except Exception as e:
-                    logger.error(f"[{validation_id}] HIBP error: {str(e)[:200]}")
-                    breach_info = None
-            
-            # ============================================================
-            # PASO 4: Analizar proveedor CON TIMEOUT
-            # ============================================================
-            logger.info(f"{validation_id} | Analyzing provider...")
-            
-            try:
-                provider_analysis = await asyncio.wait_for(
-                    analyze_email_provider(
-                        email_normalized, 
-                        redis=redis,
-                        timeout=5.0
-                    ),
-                    timeout=6.0
-                )
-                logger.info(
-                    f"[{validation_id}] Provider analysis complete | "
-                    f"Provider: {provider_analysis.provider} | "
-                    f"SPF: {provider_analysis.dns_auth.spf} | "
-                    f"DKIM: {provider_analysis.dns_auth.dkim.status} | "
-                    f"Reputation: {provider_analysis.reputation}"
-                )
-            
-            except asyncio.TimeoutError:
-                logger.warning(f"Provider analysis TIMEOUT for {email_normalized}")
-                provider_analysis = ProviderAnalysis(
-                    domain=email_normalized.split("@")[-1],
-                    primary_mx=None,
-                    ip=None,
-                    asn_info=None,
-                    dns_auth=DNSAuthResults(
-                        spf="no-spf",
-                        dkim=DKIMInfo(
-                            status="not_found",
-                            record=None,
-                            selector=None,
-                            key_type=None,
-                            key_length=None
-                        ),
-                        dmarc="no-dmarc"
-                    ),
-                    provider="generic",
-                    fingerprint="",
-                    reputation=0.5,
-                    cached=False,
-                    error="timeout"
-                )
-            
-            except Exception as e:
-                logger.error(f"Provider analysis ERROR: {str(e)[:200]}", exc_info=True)
-                provider_analysis = ProviderAnalysis(
-                    domain=email_normalized.split("@")[-1],
-                    primary_mx=None,
-                    ip=None,
-                    asn_info=None,
-                    dns_auth=DNSAuthResults(
-                        spf="error",
-                        dkim=DKIMInfo(
-                            status="error",
-                            record=None,
-                            selector=None,
-                            key_type=None,
-                            key_length=None
-                        ),
-                        dmarc="error"
-                    ),
-                    provider="unknown",
-                    fingerprint="",
-                    reputation=0.1,
-                    cached=False,
-                    error=str(e)[:200]
-                )
+                    logger.bind(request_id=validation_id).error(f"HIBP error: {str(e)[:200]}")
             
             # ============================================================
             # PASO 5: Validar dominio (DNS/MX checks)
             # ============================================================
-            domain_result = await self._validate_domain(email_normalized, redis, testing_mode)
+            domain_result = await self._validate_domain(
+                email=email_normalized,
+                redis=redis,
+                testing_mode=testing_mode,
+                validation_id=validation_id
+            )
 
             # 🔹 LOG DE DEBUGGING: Verificar qué devuelve domain_result
-            logger.info(
+            logger.bind(request_id=validation_id).info(
                 f"[{validation_id}] Domain validation complete | "
                 f"valid={domain_result.valid} | "
                 f"error_type={domain_result.error_type} | "
@@ -1065,9 +1015,15 @@ class EmailValidationEngine:
                     "abuse_domain",          # Dominio de abuso conocido
                     "disposable_domain",     # Dominio descartable
                 ]:
-                    logger.info(
-                        f"[{validation_id}] Domain validation FAILED (terminal) | "
+                    logger.bind(request_id=validation_id).info(
+                        f"Domain validation FAILED (terminal) | "
                         f"Error: {error_type} | Detail: {domain_result.detail}"
+                    )
+                    
+                    # Get provider info with fallback values
+                    provider_info, provider_analysis = await self._get_provider_info(
+                        domain_result.mx_host, 
+                        validation_id=validation_id
                     )
                     
                     # ✅ 200 OK: Email procesable pero dominio no válido
@@ -1079,9 +1035,9 @@ class EmailValidationEngine:
                         detail=domain_result.detail or "Domain validation failed",
                         status_code=status.HTTP_200_OK,
                         error_type=error_type,
-                        provider=provider_analysis.provider,
-                        reputation=provider_analysis.reputation,
-                        fingerprint=provider_analysis.fingerprint,
+                        provider=provider_info["provider"],
+                        reputation=provider_info["reputation"],
+                        fingerprint=provider_info["fingerprint"],
                         client_plan=resolved_plan,
                         suggested_fixes=suggested_fixes,
                         spam_trap_info=spam_trap_check,
@@ -1097,8 +1053,8 @@ class EmailValidationEngine:
                     "no_mx_has_a",                   # MX ausente pero A record existe
                     "unsafe_mx_host",                # MX apunta a localhost/IPs privadas
                 ]:
-                    logger.info(
-                        f"[{validation_id}] Domain has issues but CONTINUING | "
+                    logger.bind(request_id=validation_id).info(
+                        f"Domain has issues but CONTINUING | "
                         f"Error: {error_type} | Detail: {domain_result.detail} | "
                         f"Will include error_type in final response"
                     )
@@ -1109,9 +1065,15 @@ class EmailValidationEngine:
                 # CASOS DESCONOCIDOS (terminar por seguridad)
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 else:
-                    logger.warning(
-                        f"[{validation_id}] Domain validation FAILED (unknown error) | "
+                    logger.bind(request_id=validation_id).warning(
+                        f"Domain validation FAILED (unknown error) | "
                         f"Error: {error_type} | Detail: {domain_result.detail}"
+                    )
+                    
+                    # Get provider info with fallback values
+                    provider_info, provider_analysis = await self._get_provider_info(
+                        domain_result.mx_host, 
+                        validation_id=validation_id
                     )
                     
                     # ✅ 200 OK: Email procesable pero error desconocido
@@ -1123,9 +1085,9 @@ class EmailValidationEngine:
                         detail=domain_result.detail or "Domain validation failed",
                         status_code=status.HTTP_200_OK,
                         error_type=error_type,
-                        provider=provider_analysis.provider,
-                        reputation=provider_analysis.reputation,
-                        fingerprint=provider_analysis.fingerprint,
+                        provider=provider_info["provider"],
+                        reputation=provider_info["reputation"],
+                        fingerprint=provider_info["fingerprint"],
                         client_plan=resolved_plan,
                         suggested_fixes=suggested_fixes,
                         spam_trap_info=spam_trap_check,
@@ -1135,8 +1097,8 @@ class EmailValidationEngine:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # Si llegamos aquí: domain_result.valid=True O error_type permite continuar
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            logger.info(
-                f"[{validation_id}] Proceeding to next validation steps | "
+            logger.bind(request_id=validation_id).info(
+                f"Proceeding to next validation steps | "
                 f"domain_valid={domain_result.valid}"
             )
 
@@ -1147,17 +1109,27 @@ class EmailValidationEngine:
             from app.providers import detect_role_email
             
             role_email_info = detect_role_email(email_normalized)
-            logger.info(
-                f"[{validation_id}] Role email check | "
+            logger.bind(request_id=validation_id).info(
+                f"Role email check | "
                 f"Is role: {role_email_info.get('is_role_email')} | "
                 f"Type: {role_email_info.get('role_type')}"
             )
             
             if role_email_info.get("is_role_email"):
-                logger.warning(f"[{validation_id}] Role email detected: {role_email_info['role_type']}")
+                logger.bind(request_id=validation_id).warning(f"Role email detected: {role_email_info['role_type']}")
             
             # ============================================================
             # PASO 7: Realizar validación SMTP
+            # ============================================================
+            # Get provider info with fallback values
+            # ============================================================
+            provider_info, provider_analysis = await self._get_provider_info(
+                domain_result.mx_host, 
+                validation_id=validation_id
+            )
+            
+            # ============================================================
+            # SMTP Validation
             # ============================================================
             smtp_result = await self._perform_smtp_validation(
                 email_normalized,
@@ -1165,27 +1137,13 @@ class EmailValidationEngine:
                 check_smtp,
                 plan,
                 redis,
-                provider_analysis.fingerprint,
+                provider_info["fingerprint"],
             )
             
             # ============================================================
-            # PASO 8: Convertir reputation de forma segura
+            # PASO 8: Get safe reputation from provider info
             # ============================================================
-            try:
-                if provider_analysis.reputation is None:
-                    safe_reputation = 0.5
-                elif isinstance(provider_analysis.reputation, (int, float)):
-                    safe_reputation = float(provider_analysis.reputation)
-                elif isinstance(provider_analysis.reputation, str):
-                    safe_reputation = float(provider_analysis.reputation) if provider_analysis.reputation.strip() else 0.5
-                else:
-                    safe_reputation = 0.5
-                
-                safe_reputation = max(0.0, min(1.0, safe_reputation))
-            
-            except (ValueError, TypeError, AttributeError) as e:
-                logger.warning(f"Could not convert reputation: {provider_analysis.reputation} | Error: {e}")
-                safe_reputation = 0.5
+            safe_reputation = max(0.0, min(1.0, provider_info["reputation"]))
             
             # ============================================================
             # PASO 9: Ajustar risk_score si está en breach
@@ -1193,7 +1151,7 @@ class EmailValidationEngine:
             initial_risk_score = None
             if breach_info and breach_info.get("in_breach"):
                 initial_risk_score = min(1.0, safe_reputation + 0.3)
-                logger.warning(f"[{validation_id}] Risk score increased due to breach")
+                logger.bind(request_id=validation_id or "breach-detection").warning("Risk score increased due to breach")
             
             # ============================================================
             # PASO 10: Determinar si se usó cache
@@ -1211,11 +1169,11 @@ class EmailValidationEngine:
                     if not full_validation_cached:
                         # Guardar en caché por 1 hora
                         await redis.setex(validation_cache_key, 3600, "1")
-                        logger.debug(f"First validation for {email_normalized}, marking in cache")
+                        logger.bind(request_id=validation_id or "caching").debug(f"First validation for {email_normalized}, marking in cache")
                     else:
-                        logger.debug(f"Validation cache HIT for {email_normalized}")
+                        logger.bind(request_id=validation_id or "caching").debug(f"Validation cache HIT for {email_normalized}")
             except Exception as cache_err:
-                logger.debug(f"Cache check failed: {cache_err}")
+                logger.bind(request_id=validation_id or "caching").debug(f"Cache check failed: {cache_err}")
                 full_validation_cached = False
             
             # Solo marcar como cached si esta VALIDACIÓN COMPLETA ya se ejecutó antes
@@ -1242,8 +1200,8 @@ class EmailValidationEngine:
                         timeout=10.0  # 10s timeout for catch-all check
                     )
                     
-                    logger.info(
-                        f"[{validation_id}] Catch-all check | "
+                    logger.bind(request_id=validation_id).info(
+                        f"Catch-all check | "
                         f"Domain: {domain} | "
                         f"Is catch-all: {catch_all_info.get('is_catch_all')} | "
                         f"Confidence: {catch_all_info.get('confidence'):.2f} | "
@@ -1251,7 +1209,7 @@ class EmailValidationEngine:
                     )
                 
                 except asyncio.TimeoutError:
-                    logger.warning(f"[{validation_id}] Catch-all detection timeout")
+                    logger.bind(request_id=validation_id or "catch-all").warning("Catch-all detection timeout")
                     catch_all_info = {
                         'is_catch_all': False, 
                         'confidence': 0.0, 
@@ -1260,7 +1218,7 @@ class EmailValidationEngine:
                     }
                 
                 except Exception as e:
-                    logger.error(f"[{validation_id}] Catch-all detection error: {e}")
+                    logger.bind(request_id=validation_id or "catch-all").error(f"Catch-all detection error: {e}")
                     catch_all_info = {
                         'is_catch_all': False, 
                         'confidence': 0.0, 
@@ -1268,7 +1226,7 @@ class EmailValidationEngine:
                         'details': str(e)[:100]
                     }
             else:
-                logger.debug(f"[{validation_id}] Catch-all check skipped (check_smtp=false)")
+                logger.bind(request_id=validation_id or "catch-all").debug("Catch-all check skipped (check_smtp=false)")
             
             # ============================================================
             # PASO 12: CALCULAR RISK ASSESSMENT
@@ -1309,8 +1267,8 @@ class EmailValidationEngine:
             # Convertir a rango 0-1 para compatibilidad
             risk_score_01 = round(risk.score / 100.0, 3)
             
-            logger.info(
-                f"[{validation_id}] Risk assessment | "
+            logger.bind(request_id=validation_id).info(
+                f"Risk assessment | "
                 f"Score: {risk.score}/100 | "
                 f"Level: {risk.level} | "
                 f"Confidence: {risk.confidence:.2%} | "
@@ -1322,8 +1280,8 @@ class EmailValidationEngine:
             # ============================================================
 
             # 🔹 LOG PREVIO: Estado antes de construir respuesta
-            logger.info(
-                f"[{validation_id}] Pre-response state | "
+            logger.bind(request_id=validation_id).info(
+                f"Pre-response state | "
                 f"email_is_valid={email_is_valid} | "
                 f"domain_result.valid={domain_result.valid} | "
                 f"domain_result.error_type={domain_result.error_type} | "
@@ -1349,8 +1307,8 @@ class EmailValidationEngine:
             if not email_is_valid:
                 # Si email no es válido, siempre incluir error_type
                 final_error_type = domain_result.error_type or "validation_failed"
-                logger.debug(
-                    f"[{validation_id}] error_type set (invalid email) | "
+                logger.bind(request_id=validation_id or "error-handling").debug(
+                    f"error_type set (invalid email) | "
                     f"domain_error={domain_result.error_type} | "
                     f"final={final_error_type}"
                 )
@@ -1363,23 +1321,23 @@ class EmailValidationEngine:
             ]:
                 # ✅ Casos especiales: email válido pero con problemas de infraestructura
                 final_error_type = domain_result.error_type
-                logger.info(
-                    f"[{validation_id}] error_type set (infrastructure issue) | "
+                logger.bind(request_id=validation_id or "error-handling").info(
+                    f"error_type set (infrastructure issue) | "
                     f"error_type={final_error_type} | "
                     f"email_is_valid={email_is_valid}"
                 )
 
             else:
                 # Email válido sin problemas o con problemas que no requieren error_type
-                logger.debug(
-                    f"[{validation_id}] No error_type (clean validation) | "
+                logger.bind(request_id=validation_id or "error-handling").debug(
+                    f"No error_type (clean validation) | "
                     f"email_is_valid={email_is_valid} | "
                     f"domain_error_type={domain_result.error_type}"
                 )
 
             # 🔹 LOG FINAL: Qué se va a pasar a ResponseBuilder
-            logger.info(
-                f"[{validation_id}] Building response | "
+            logger.bind(request_id=validation_id).info(
+                f"Building response | "
                 f"valid={email_is_valid} | "
                 f"error_type={final_error_type} | "
                 f"risk_score={risk_score_01} | "
@@ -1390,41 +1348,98 @@ class EmailValidationEngine:
             # CONSTRUIR RESPUESTA CON ResponseBuilder
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            response = await ResponseBuilder.build_validation_response(
-                email=email_normalized,
-                start_time=start_time,
-                valid=email_is_valid,
-                validation_id=validation_id,
-                detail=detail_message,
-                status_code=status.HTTP_200_OK,  # ✅ SIEMPRE 200 si input fue procesable
-                error_type=final_error_type,      # ✅ Usar el error_type calculado
-                smtp_checked=smtp_result["checked"],
-                mx_server=domain_result.mx_host,
-                mailbox_exists=smtp_result["mailbox_exists"],
-                skip_reason=smtp_result["skip_reason"],
-                is_restricted=is_restricted,
-                provider=provider_analysis.provider,
-                fingerprint=provider_analysis.fingerprint,
-                reputation=safe_reputation,
-                include_raw_dns=include_raw_dns,
-                spf_status=ResponseBuilder.map_spf_status(provider_analysis.dns_auth.spf),
-                spf_record=provider_analysis.dns_auth.spf if include_raw_dns else None,
-                dkim_status=provider_analysis.dns_auth.dkim.status,
-                dkim_record=provider_analysis.dns_auth.dkim.record if include_raw_dns else None,
-                dkim_selector=provider_analysis.dns_auth.dkim.selector,
-                dkim_key_type=provider_analysis.dns_auth.dkim.key_type,
-                dkim_key_length=provider_analysis.dns_auth.dkim.key_length,
-                dmarc_status=ResponseBuilder.map_dmarc_status(provider_analysis.dns_auth.dmarc),
-                dmarc_record=provider_analysis.dns_auth.dmarc if include_raw_dns else None,
-                smtp_detail=smtp_result["detail"],
-                risk_score=risk_score_01,
-                cache_used=cache_used,
-                client_plan=resolved_plan,
-                suggested_fixes=suggested_fixes,
-                breach_info=breach_info,
-                role_email_info=role_email_info,  # ✅ CRÍTICO para status="risky" en role emails
-                spam_trap_info=spam_trap_check,
-            )
+            # Build response with safe provider info
+            response_data = {
+                "email": email_normalized,
+                "start_time": start_time,
+                "valid": email_is_valid,
+                "validation_id": validation_id,
+                "detail": detail_message,
+                "status_code": status.HTTP_200_OK,  # ✅ SIEMPRE 200 si input fue procesable
+                "error_type": final_error_type,      # ✅ Usar el error_type calculado
+                "smtp_checked": smtp_result["checked"],
+                "mx_server": domain_result.mx_host,
+                "mailbox_exists": smtp_result["mailbox_exists"],
+                "skip_reason": smtp_result["skip_reason"],
+                "is_restricted": is_restricted,
+                "provider": provider_info["provider"],
+                "fingerprint": provider_info["fingerprint"],
+                "reputation": safe_reputation,
+                "include_raw_dns": include_raw_dns,
+                "smtp_detail": smtp_result["detail"],
+                "risk_score": risk_score_01,
+                "cache_used": cache_used,
+                "client_plan": resolved_plan,
+                "suggested_fixes": suggested_fixes,
+                "breach_info": breach_info,
+                "role_email_info": role_email_info,  # ✅ CRÍTICO para status="risky" en role emails
+                "spam_trap_info": spam_trap_check,
+            }
+
+            # Safely handle DNS authentication data with comprehensive error handling
+            dns_auth = None
+            if provider_analysis is not None and hasattr(provider_analysis, 'dns_auth'):
+                dns_auth = provider_analysis.dns_auth
+
+            # Initialize with default values
+            dns_updates = {
+                "spf_status": None,
+                "spf_record": None,
+                "dmarc_status": None,
+                "dmarc_record": None,
+                "dkim_status": None,
+                "dkim_record": None,
+                "dkim_selector": None,
+                "dkim_key_type": None,
+                "dkim_key_length": None
+            }
+            
+            # Skip DNS auth processing if provider_analysis is not available
+            if provider_analysis is None:
+                logger.bind(
+                    request_id=validation_id or "dns-auth",
+                    reason="provider_analysis_not_available"
+                ).debug("Skipping DNS auth processing")
+
+            try:
+                if dns_auth:
+                    # SPF
+                    spf = getattr(dns_auth, 'spf', None)
+                    if spf is not None:
+                        dns_updates.update({
+                            "spf_status": ResponseBuilder.map_spf_status(spf),
+                            "spf_record": spf if include_raw_dns else None
+                        })
+
+                    # DMARC
+                    dmarc = getattr(dns_auth, 'dmarc', None)
+                    if dmarc is not None:
+                        dns_updates.update({
+                            "dmarc_status": ResponseBuilder.map_dmarc_status(dmarc),
+                            "dmarc_record": dmarc if include_raw_dns else None
+                        })
+
+                    # DKIM
+                    dkim = getattr(dns_auth, 'dkim', None)
+                    if dkim is not None:
+                        dns_updates.update({
+                            "dkim_status": getattr(dkim, 'status', None),
+                            "dkim_record": getattr(dkim, 'record', None) if include_raw_dns else None,
+                            "dkim_selector": getattr(dkim, 'selector', None),
+                            "dkim_key_type": getattr(dkim, 'key_type', None),
+                            "dkim_key_length": getattr(dkim, 'key_length', None)
+                        })
+
+            except Exception as e:
+                logger.bind(
+                    request_id=validation_id or "dns-auth-error",
+                    error=str(e)[:200]
+                ).warning("Error processing DNS authentication data")
+
+            # Update response data with DNS information
+            response_data.update(dns_updates)
+
+            response = await ResponseBuilder.build_validation_response(**response_data)
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # AGREGAR RISK ASSESSMENT AL JSON DE RESPUESTA
@@ -1447,8 +1462,8 @@ class EmailValidationEngine:
                 
                 # 🔹 VERIFICACIÓN: Asegurar que error_type está presente si debe estarlo
                 if final_error_type and "error_type" not in response_dict:
-                    logger.warning(
-                        f"[{validation_id}] error_type lost in ResponseBuilder | "
+                    logger.bind(request_id=validation_id or "response-building").warning(
+                        f"error_type lost in ResponseBuilder | "
                         f"Expected: {final_error_type} | Injecting manually"
                     )
                     response_dict["error_type"] = final_error_type
@@ -1460,8 +1475,8 @@ class EmailValidationEngine:
                 )
                 
                 # 🔹 LOG DE CONFIRMACIÓN: Qué se está devolviendo
-                logger.info(
-                    f"[{validation_id}] Response built successfully | "
+                logger.bind(request_id=validation_id).info(
+                    f"Response built successfully | "
                     f"HTTP {response.status_code} | "
                     f"valid={response_dict.get('valid')} | "
                     f"status={response_dict.get('status')} | "
@@ -1470,15 +1485,15 @@ class EmailValidationEngine:
                 )
 
             except Exception as e:
-                logger.error(
-                    f"[{validation_id}] Failed to add risk_assessment to response: {e}",
+                logger.bind(request_id=validation_id or "error-handling").error(
+                    f"Failed to add risk_assessment to response: {e}",
                     exc_info=True
                 )
                 # Si falla, devolver response original sin risk_assessment
                 pass
 
             await self.update_validation_metrics(request, response, plan, start_time)
-            logger.info(f"[{validation_id}] Validation completed successfully")
+            logger.bind(request_id=validation_id or "validation-complete").info("Validation completed successfully")
 
             return response
 
@@ -1488,8 +1503,8 @@ class EmailValidationEngine:
 
         except APIException as e:
                 elapsed = time.time() - start_time
-                logger.warning(
-                    f"[{validation_id}] Validation error (APIException) | "
+                logger.bind(request_id=validation_id or "validation-error").warning(
+                    f"Validation error (APIException) | "
                     f"Detail: {e.detail} | Elapsed: {elapsed:.2f}s"
                 )
                 
@@ -1505,8 +1520,8 @@ class EmailValidationEngine:
 
         except Exception as e:
                 elapsed = time.time() - start_time
-                logger.error(
-                    f"[{validation_id}] Unexpected error in validation | "
+                logger.bind(request_id=validation_id).error(
+                    f"Unexpected error in validation | "
                     f"Type: {type(e).__name__} | "
                     f"Message: {str(e)[:200]} | "
                     f"Elapsed: {elapsed:.2f}s",
@@ -1535,16 +1550,16 @@ class EmailValidationEngine:
             
             plan_features = getattr(settings, "plan_features", {})
             if not plan_features:
-                logger.debug(f"No plan_features found for plan {plan}")
+                logger.bind(request_id="plan-features").debug(f"No plan_features found for plan {plan}")
                 return
                 
             plan_config = plan_features.get(plan.upper(), {})
             if not plan_config:
-                logger.debug(f"No plan_config found for plan {plan.upper()}")
+                logger.bind(request_id="plan-config").debug(f"No plan_config found for plan {plan.upper()}")
                 return
                 
             limit = int(plan_config.get("concurrent", 0) or 0)
-            logger.debug(f"Concurrency limit for {plan}: {limit}")
+            logger.bind(request_id="concurrency-limit").debug(f"Concurrency limit for {plan}: {limit}")
             
             if limit <= 0:
                 return
@@ -1556,7 +1571,12 @@ class EmailValidationEngine:
                 current_raw = await redis.get(key)
                 current = int(current_raw) if current_raw else 0
                 
-                logger.debug(f"Current concurrency for {user_id}: {current}, limit: {limit}")
+                logger.bind(
+                    request_id="concurrency-check",
+                    user_id=user_id,
+                    current=current,
+                    limit=limit
+                ).debug("Concurrency check")
                 
                 # SEGUNDO: verificar si YA está en el límite ANTES de incrementar
                 if current >= limit:
@@ -1576,14 +1596,20 @@ class EmailValidationEngine:
             except APIException:
                 raise  # Re-lanzar excepciones de validación
             except Exception as e:
-                logger.warning(f"Redis operation failed in concurrency check: {e}")
+                logger.bind(
+                    request_id="redis-error",
+                    error=str(e)
+                ).warning("Redis operation failed in concurrency check")
                 # En caso de error de Redis, permitir la operación (fail-open)
                 return
                 
         except APIException:
             raise
         except Exception as e:
-            logger.error(f"Concurrency check failed: {e}")
+            logger.bind(
+                request_id="concurrency-check-failed",
+                error=str(e)
+            ).error("Concurrency check failed")
             # En caso de error, permitir la operación
             return
 
@@ -1686,11 +1712,56 @@ class EmailValidationEngine:
 
 
 
-    async def _validate_domain(self, email: str, redis, testing_mode: bool = False) -> VerificationResult:
+    async def _get_provider_info(self, mx_host: Optional[str], validation_id: Optional[str] = None) -> tuple[dict, Optional[Any]]:
+        """Get provider information with fallback values.
+        
+        Returns:
+            tuple: (provider_info, provider_analysis) where provider_info is a dict with provider details
+                   and provider_analysis is the raw ProviderAnalysis object or None.
+        """
+        provider_info = {
+            "provider": None,
+            "reputation": 0.5,  # Default neutral reputation
+            "fingerprint": None
+        }
+        provider_analysis = None
+        
+        if not mx_host:
+            return provider_info, provider_analysis
+            
+        try:
+            from app.providers import analyze_email_provider
+            provider_analysis = await analyze_email_provider(mx_host)
+            if provider_analysis:
+                provider_info.update({
+                    "provider": getattr(provider_analysis, "provider", None),
+                    "reputation": float(getattr(provider_analysis, "reputation", 0.5)),
+                    "fingerprint": getattr(provider_analysis, "fingerprint", None)
+                })
+        except Exception as e:
+            logger.bind(request_id=validation_id or "provider-analysis").warning(
+                f"Could not get provider analysis: {str(e)[:200]}"
+            )
+        
+        return provider_info, provider_analysis
+
+    async def _validate_domain(
+        self, 
+        email: str, 
+        redis, 
+        testing_mode: bool = False,
+        validation_id: Optional[str] = None
+    ) -> VerificationResult:
         """
         ✅ Valida que el dominio existe y tiene registros MX válidos.
         
-        Retorna:
+        Args:
+            email: Email a validar
+            redis: Cliente Redis para caché
+            testing_mode: Si está en modo de prueba
+            validation_id: ID de validación para seguimiento de logs
+            
+        Returns:
             VerificationResult con:
             - valid: bool → True si dominio tiene MX records
             - detail: str → Descripción del resultado
@@ -1717,7 +1788,10 @@ class EmailValidationEngine:
         # Extraer dominio del email
         _, domain = email.split("@")
         
-        logger.info(f"Validating domain: {domain}")
+        logger.bind(
+            request_id=validation_id or "domain-validation",
+            domain=domain
+        ).info("Starting domain validation")
         
         try:
             # ✅ Usar cachedcheckdomain de validation.py
@@ -1740,20 +1814,28 @@ class EmailValidationEngine:
             # }
             
             if result.valid:
-                logger.info(
-                    f"Domain validation SUCCESS: {domain} | "
-                    f"MX: {result.mx_host} | Detail: {result.detail}"
-                )
+                logger.bind(
+                    request_id=validation_id or "domain-validation",
+                    domain=domain,
+                    mx_host=result.mx_host,
+                    detail=result.detail
+                ).info("Domain validation successful")
             else:
-                logger.warning(
-                    f"Domain validation FAILED: {domain} | "
-                    f"Error: {result.error_type} | Detail: {result.detail}"
-                )
+                logger.bind(
+                    request_id=validation_id or "domain-validation",
+                    domain=domain,
+                    error_type=result.error_type,
+                    detail=result.detail
+                ).warning("Domain validation failed")
             
             return result
         
         except Exception as e:
-            logger.error(f"Unexpected error validating domain {domain}: {str(e)}", exc_info=True)
+            logger.bind(
+                request_id=validation_id or "domain-validation",
+                domain=domain,
+                error=str(e)
+            ).error("Unexpected error during domain validation", exc_info=True)
             
             # Retornar error genérico con estructura VerificationResult
             return VerificationResult(
@@ -1822,7 +1904,7 @@ class EmailValidationEngine:
         
         # ✅ 4. EJECUTAR SMTP VALIDATION EN PRODUCCIÓN (sin Docker bypass)
         try:
-            logger.debug(f"[SMTP] Starting validation for {email} on {mx_host}")
+            logger.bind(request_id="smtp-validation").debug(f"Starting validation for {email} on {mx_host}")
             
             # Usar check_smtp_mailbox_safe con timeout
             exists, detail = await asyncio.wait_for(
@@ -1830,8 +1912,8 @@ class EmailValidationEngine:
                 timeout=30
             )
             
-            logger.info(
-                f"[SMTP] Validation complete: {email} | "
+            logger.bind(request_id="smtp-validation").info(
+                f"Validation complete: {email} | "
                 f"Exists: {exists} | Host: {mx_host}"
             )
             
@@ -1852,7 +1934,7 @@ class EmailValidationEngine:
                         timeout=2
                     )
                 except Exception as e:
-                    logger.debug(f"Could not update reputation: {e}")
+                    logger.bind(request_id="smtp-validation").debug(f"Could not update reputation: {e}")
             
             return {
                 "checked": True,
@@ -1865,7 +1947,7 @@ class EmailValidationEngine:
             }
         
         except asyncio.TimeoutError:
-            logger.warning(f"[SMTP] Timeout for {email} on {mx_host}")
+            logger.bind(request_id="smtp-timeout").warning(f"SMTP Timeout for {email} on {mx_host}")
             return {
                 "checked": True,
                 "mailbox_exists": None,
@@ -1877,7 +1959,7 @@ class EmailValidationEngine:
             }
         
         except Exception as e:
-            logger.error(f"[SMTP] Error for {email}: {str(e)[:200]}", exc_info=True)
+            logger.bind(request_id="smtp-error").error(f"SMTP Error for {email}: {str(e)[:200]}", exc_info=True)
             return {
                 "checked": True,
                 "mailbox_exists": None,
@@ -1936,7 +2018,7 @@ class EmailValidationEngine:
             error_type = error.error_type
             detail = error.detail
             
-            logger.warning(
+            logger.bind(request_id=validation_id or "validation-error").warning(
                 f"APIException | Email: {email} | Type: {error_type} | "
                 f"Detail: {detail} | Elapsed: {elapsed:.2f}s"
             )
@@ -1945,7 +2027,7 @@ class EmailValidationEngine:
             error_type = type(error).__name__
             detail = "Email validation service unavailable"
             
-            logger.error(
+            logger.bind(request_id=validation_id or "validation-error").error(
                 f"Unhandled Exception | Email: {email} | Type: {error_type} | "
                 f"Message: {str(error)[:200]} | Elapsed: {elapsed:.2f}s",
                 exc_info=True,
@@ -1959,7 +2041,7 @@ class EmailValidationEngine:
                 component="validation",
             )
         except Exception as metrics_error:
-            logger.warning(f"Failed to record metrics: {metrics_error}")
+            logger.bind(request_id=validation_id or "metrics-error").warning(f"Failed to record metrics: {metrics_error}")
         
         # ✅ PASO 3: Construir respuesta usando ResponseBuilder
         try:
@@ -1985,10 +2067,10 @@ class EmailValidationEngine:
         
         except Exception as build_error:
             # ✅ FALLBACK CRÍTICO
-            logger.error(
-                f"Failed to build error response: {build_error}",
-                exc_info=True,
-            )
+            logger.bind(
+                request_id=validation_id or "response-build-error",
+                error=str(build_error)
+            ).error("Failed to build error response", exc_info=True)
             
             # Construir contenido base del fallback
             fallback_content = {
@@ -2193,7 +2275,9 @@ class FileValidationService:
                 try:
                     file.file.close()
                 except Exception:
-                    logger.debug("Failed to close upload stream", exc_info=True)
+                    logger.bind(
+                        request_id="file-upload"
+                    ).debug("Failed to close upload stream", exc_info=True)
 
 
     # Métodos bloqueantes auxiliares (para executor)
@@ -2226,7 +2310,10 @@ class FileValidationService:
                     # Evita path traversal
                     norm = fname.replace("\\", "/")
                     if os.path.isabs(norm) or ".." in norm.split("/"):
-                        logger.warning(f"Path traversal attempt detected: {fname}")
+                        logger.bind(
+                            request_id="security",
+                            filename=fname
+                        ).warning("Path traversal attempt detected")
                         raise APIException(
                             detail=f"Security violation: Path traversal in ZIP ('{fname}')",
                             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2251,7 +2338,10 @@ class FileValidationService:
                     if total_uncompressed > max_uncompressed_zip:
                         if emails:
                             # Ya tenemos emails, devolver lo recolectado
-                            logger.warning(f"ZIP size limit reached, returning {len(emails)} emails")
+                            logger.bind(
+                                request_id="zip-processing",
+                                email_count=len(emails)
+                            ).warning("ZIP size limit reached, returning partial results")
                             break
                         else:
                             # No hay emails aún, rechazar
@@ -2304,7 +2394,11 @@ class FileValidationService:
                         except Exception:
                             dialect = csv.excel
                     except Exception as e:
-                        logger.error(f"CSV sniff failed for {fname}: {e}")
+                        logger.bind(
+                            request_id="csv-processing",
+                            filename=fname,
+                            error=str(e)
+                        ).error("CSV sniff failed")
                         dialect = csv.excel
 
                     with zf.open(info) as fh:
@@ -2473,7 +2567,11 @@ class FileValidationService:
             else:
                 return []
         except Exception as e:
-            logger.error(f"Error processing {file_type} content: {e}")
+            logger.bind(
+                request_id="file-processing",
+                file_type=file_type,
+                error=str(e)
+            ).error("Error processing file content")
             raise APIException(
                 detail=f"Error processing {file_type.upper()} file",
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -2594,25 +2692,6 @@ class FileValidationService:
 file_validation_service = FileValidationService()
 
 
-# ---------------------------
-# Endpoints Principales
-# ---------------------------
-
-from app.config import SAFE_CONTENT_TYPES
-
-async def validate_content_type(request: Request) -> str:
-    """Dependency: Validar Content-Type desde middleware"""
-    content_type = (request.headers.get("Content-Type") or "").lower()
-    if request.method in ("POST", "PUT", "PATCH"):
-        valid = any(ct.startswith(content_type) for ct in SAFE_CONTENT_TYPES)
-        if not valid:
-            raise HTTPException(
-                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                detail="Only 'application/json' accepted"
-            )
-    return content_type
-
-
 def _get_plan_config_safe(plan: str) -> dict:
     """Obtener configuración de plan (igual que en utils.py)"""
     plan_upper = plan.upper() if plan else "FREE"
@@ -2675,11 +2754,15 @@ async def validate_email_endpoint(
     is_docker = os.getenv("ENVIRONMENT", "").lower() == "docker"
     
     safe_email = mask_email(email)
-    logger.info(
-        f"Email validation | User: {user_id} | Plan: {plan_upper} | "
-        f"Email: {safe_email} | Env: {'docker' if is_docker else 'production'} | "
-        f"SMTP: {check_smtp} | DNS: {include_raw_dns} | Testing: {testing_mode}"
-    )
+    logger.bind(
+        user_id=user_id,
+        plan=plan_upper,
+        email=safe_email,
+        environment='docker' if is_docker else 'production',
+        check_smtp=check_smtp,
+        include_raw_dns=include_raw_dns,
+        testing_mode=testing_mode
+    ).info("Starting email validation")
     
     email_normalized = None
     is_valid = False
@@ -2697,10 +2780,11 @@ async def validate_email_endpoint(
             
             # Si es testing_mode y termina en .test, registrar en log
             if testing_mode and temp_domain.endswith('.test'):
-                logger.info(
-                    f"Testing mode enabled: allowing special-use TLD .test | "
-                    f"Domain: {temp_domain} | Request: {request_id}"
-                )
+                logger.bind(
+                    request_id="testing-mode",
+                    domain=temp_domain,
+                    request_id_original=request_id
+                ).info("Testing mode enabled: allowing special-use TLD .test")
                 # NO bloquear aquí - permitir que continúe el flujo normal
                 # La validación en validation.py respetará testing_mode
         except Exception as domain_extract_err:
@@ -2758,7 +2842,7 @@ async def validate_email_endpoint(
         # ============================================================
         try:
             timeout_seconds = {
-                "FREE": 15.0,      # 15 segundos para FREE
+                "FREE": 8.0,      # 15 segundos para FREE
                 "PREMIUM": 45.0,   # 45 segundos para PREMIUM
                 "ENTERPRISE": 60.0 # 60 segundos para ENTERPRISE
             }.get(plan_upper, 20.0)

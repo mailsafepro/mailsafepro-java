@@ -91,7 +91,7 @@ class OptimizedRedisPool:
             
             # Test connection
             await self._client.ping()
-            logger.info(
+            logger.bind(request_id="startup").info(
                 "Redis connection pool initialized",
                 max_connections=self.max_connections,
                 health_check_interval=self.health_check_interval
@@ -103,7 +103,7 @@ class OptimizedRedisPool:
             return self._client
             
         except Exception as e:
-            logger.error("Failed to initialize Redis pool", error=str(e))
+            logger.bind(request_id="startup").error("Failed to initialize Redis pool", error=str(e))
             raise
     
     async def _health_check_loop(self):
@@ -115,13 +115,13 @@ class OptimizedRedisPool:
                 if self._client:
                     await self._client.ping()
                     self._stats["health_checks_passed"] += 1
-                    logger.debug("Redis health check passed")
+                    logger.bind(request_id="redis-health").debug("Redis health check passed")
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self._stats["health_checks_failed"] += 1
-                logger.warning("Redis health check failed", error=str(e))
+                logger.bind(request_id="redis-health").warning("Redis health check failed", error=str(e))
     
     async def close(self):
         """Close connection pool gracefully."""
@@ -135,7 +135,7 @@ class OptimizedRedisPool:
         if self._client:
             await self._client.close()
             await self.pool.disconnect()
-            logger.info("Redis connection pool closed")
+            logger.bind(request_id="shutdown").info("Redis connection pool closed")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get connection pool statistics."""
@@ -205,7 +205,7 @@ class OptimizedHTTPPool:
             raise_for_status=False,  # Handle errors manually
         )
         
-        logger.info(
+        logger.bind(request_id="startup").info(
             "HTTP connection pool initialized",
             max_connections=self.max_connections,
             max_per_host=self.max_connections_per_host
@@ -241,14 +241,19 @@ class OptimizedHTTPPool:
                 yield response
         except Exception as e:
             self._stats["errors"] += 1
-            logger.error("HTTP request failed", method=method, url=url, error=str(e))
+            logger.bind(request_id="http-request").error(
+                "HTTP request failed", 
+                method=method, 
+                url=url, 
+                error=str(e)
+            )
             raise
     
     async def close(self):
         """Close HTTP session and connector."""
         if self._session and not self._session.closed:
             await self._session.close()
-            logger.info("HTTP connection pool closed")
+            logger.bind(request_id="shutdown").info("HTTP connection pool closed")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get HTTP pool statistics."""
