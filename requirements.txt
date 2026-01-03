@@ -86,7 +86,7 @@ datamodel-code-generator==0.25.2
 # OBSERVABILITY (Optional - can be disabled)
 # ============================================
 opentelemetry-api==1.22.0
-opentelemetry-sdk==1.22.0
+opentelemetry-sdk==1.39.1
 opentelemetry-instrumentation-fastapi==0.43b0
 opentelemetry-instrumentation-redis==0.43b0
 opentelemetry-instrumentation-aiohttp-client==0.43b0
