@@ -27,46 +27,31 @@ Building the API client library requires:
 
 ## Installation
 
-### Option 1: JitPack (Recommended - No account needed!)
+### Recommended: Clone and Build Locally
 
-JitPack builds Maven packages directly from GitHub. This is the easiest way to use this SDK.
+The easiest way to use this SDK is to clone the repository and build it locally:
 
-Add JitPack repository to your `pom.xml`:
-
-```xml
-<repositories>
-    <repository>
-        <id>jitpack.io</id>
-        <url>https://jitpack.io</url>
-    </repository>
-</repositories>
+```bash
+git clone https://github.com/mailsafepro/mailsafepro-java.git
+cd mailsafepro-java
+./gradlew build install
 ```
 
-Then add the dependency:
+Then add to your project's `pom.xml`:
 
 ```xml
 <dependency>
-    <groupId>com.github.mailsafepro</groupId>
-    <artifactId>mailsafepro-java</artifactId>
-    <version>v1.0.0</version>
+    <groupId>com.mailsafepro</groupId>
+    <artifactId>mailsafepro-sdk</artifactId>
+    <version>1.0.0</version>
 </dependency>
 ```
 
-For Gradle users:
+### Alternative: Download Release
 
-```gradle
-repositories {
-    maven { url 'https://jitpack.io' }
-}
+Download the latest release from: https://github.com/mailsafepro/mailsafepro-java/releases
 
-dependencies {
-    implementation 'com.github.mailsafepro:mailsafepro-java:v1.0.0'
-}
-```
-
-[![](https://jitpack.io/v/mailsafepro/mailsafepro-java.svg)](https://jitpack.io/#mailsafepro/mailsafepro-java)
-
-### Option 2: Build from source
+### Build from source
 
 To install the API client library to your local Maven repository, simply execute:
 
