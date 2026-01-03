@@ -6,18 +6,18 @@
     <packaging>jar</packaging>
     <name>mailsafepro-sdk</name>
     <version>1.0.0</version>
-    <url>https://github.com/openapitools/openapi-generator</url>
+    <url>https://github.com/mailsafepro/mailsafepro-java</url>
     <description>MailSafePro Email Validation API Client</description>
     <scm>
-        <connection>scm:git:git@github.com:openapitools/openapi-generator.git</connection>
-        <developerConnection>scm:git:git@github.com:openapitools/openapi-generator.git</developerConnection>
-        <url>https://github.com/openapitools/openapi-generator</url>
+        <connection>scm:git:git@github.com:mailsafepro/mailsafepro-java.git</connection>
+        <developerConnection>scm:git:git@github.com:mailsafepro/mailsafepro-java.git</developerConnection>
+        <url>https://github.com/mailsafepro/mailsafepro-java</url>
     </scm>
 
     <licenses>
         <license>
-            <name>Unlicense</name>
-            <url>http://unlicense.org</url>
+            <name>MIT</name>
+            <url>https://opensource.org/licenses/MIT</url>
             <distribution>repo</distribution>
         </license>
     </licenses>
