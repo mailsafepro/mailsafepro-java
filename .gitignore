@@ -9,6 +9,7 @@ cosas.txt
 .env
 .env.*
 !.env.example
+!.env.test.example
 secrets/
 credentials/
 
@@ -125,3 +126,18 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Test results and sensitive data - NEVER COMMIT
+resultados_test*.txt
+test_results*.txt
+*_results.txt
+
+# JWT tokens and auth files
+*token*.txt
+*jwt*.txt
+*auth*.txt
+
+# API logs with sensitive data
+logs/api.log
+logs/*.log
+.env.test
