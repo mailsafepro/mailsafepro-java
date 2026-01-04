@@ -1,6 +1,6 @@
 /*
  * Email Validation API — Enterprise-grade Email Verification
- * API robusta y segura para validación y verificación de correos electrónicos. Soporta verificación individual y en lote, detección de brechas, y autenticación JWT. Cumple con GDPR y dispone de planes de pago flexibles.  **🔗 Enlaces importantes:** - [Estado del sistema](https://mailsafepro.betteruptime.com) - [Documentación completa](https://email-validation-api-jlra.onrender.com/redoc)  **📧 Contacto:** mailsafepro1@gmail.com
+ * API robusta y segura para validación y verificación de correos electrónicos. Soporta verificación individual y en lote, detección de brechas, y autenticación JWT. Cumple con GDPR y dispone de planes de pago flexibles.  **🔗 Enlaces importantes:** - [Estado del sistema](https://mailsafepro.betteruptime.com) - [Documentación completa](https://mailsafepro-api.fly.dev/redoc)  **📧 Contacto:** mailsafepro1@gmail.com
  *
  * The version of the OpenAPI document: 2.5.0
  * 
