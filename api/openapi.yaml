@@ -1,0 +1,2835 @@
+openapi: 3.1.0
+info:
+  description: |-
+    API robusta y segura para validación y verificación de correos electrónicos.
+    Soporta verificación individual y en lote, detección de brechas, y autenticación JWT.
+    Cumple con GDPR y dispone de planes de pago flexibles.
+
+    **🔗 Enlaces importantes:**
+    - [Estado del sistema](https://mailsafepro.betteruptime.com)
+    - [Documentación completa](https://email-validation-api-jlra.onrender.com/redoc)
+
+    **📧 Contacto:** mailsafepro1@gmail.com
+  title: Email Validation API — Enterprise-grade Email Verification
+  version: 2.5.0
+servers:
+- url: /
+paths:
+  /gemini:
+    get:
+      description: Llama a Gemini para generar texto a partir de un prompt
+      operationId: ask_gemini_gemini_get
+      parameters:
+      - explode: true
+        in: query
+        name: prompt
+        required: true
+        schema:
+          title: Prompt
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Ask Gemini
+      x-accepts:
+      - application/json
+  /health/liveness:
+    get:
+      description: |-
+        ✅ MEJORA: Kubernetes liveness probe
+
+        Returns 200 if the application is alive (not deadlocked)
+        Used by Kubernetes to restart the pod if unhealthy
+      operationId: liveness_check_health_liveness_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Liveness Check
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+  /health/readiness:
+    get:
+      description: |-
+        ✅ MEJORA: Kubernetes readiness probe
+
+        Returns 200 if the application is ready to serve traffic
+        Checks all critical dependencies (PostgreSQL, Redis, ARQ)
+      operationId: readiness_check_health_readiness_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Readiness Check
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+  /health/startup:
+    get:
+      description: |-
+        ✅ MEJORA: Kubernetes startup probe
+
+        Returns 200 once the application has completed startup
+        Used to delay readiness checks until startup is complete
+      operationId: startup_check_health_startup_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Startup Check
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+  /healthcheck:
+    get:
+      description: Basic health check endpoint (backward compatibility)
+      operationId: healthcheck_healthcheck_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Healthcheck
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+    head:
+      description: Basic health check endpoint (backward compatibility)
+      operationId: healthcheck_healthcheck_head
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Healthcheck
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+  /auth/register:
+    post:
+      description: "Registro de usuario para panel web: crea usuario, API key y tokens."
+      operationId: register_web_user_auth_register_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserRegister"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                title: Response Register Web User Auth Register Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Register Web User
+      tags:
+      - Authentication
+      - Authentication
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /auth/login:
+    post:
+      description: |-
+        Login de usuario para panel web.
+
+        Security features:
+        - Rate limiting por email + IP
+        - Timing attack protection
+        - Generic error messages
+        - PII masking en logs
+      operationId: login_web_user_auth_login_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserLogin"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Login Web User Auth Login Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Login Web User
+      tags:
+      - Authentication
+      - Authentication
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /auth/me:
+    get:
+      description: Devuelve información básica del usuario actual.
+      operationId: get_current_user_auth_me_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Get Current User Auth Me Get
+                type: object
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Get Current User
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+  /auth/refresh:
+    post:
+      description: Crea un nuevo par de tokens a partir de un refresh token válido
+        y no revocado.
+      operationId: refresh_token_auth_refresh_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Refresh Token Auth Refresh Post
+                type: object
+          description: Successful Response
+      summary: Refresh Token
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+  /auth/delete:
+    delete:
+      description: |-
+        Elimina la cuenta del usuario autenticado y todos sus datos relacionados.
+
+        ⚠️ ADVERTENCIA: Esta operación es IRREVERSIBLE.
+
+        Elimina:
+        - Datos del usuario
+        - Todas las API keys
+        - Usage/quota
+        - Suscripciones
+        - Rate limits
+        - Tokens relacionados
+
+        Security:
+        - Solo el usuario puede eliminarse a sí mismo (o admin)
+        - Requiere autenticación válida
+        - Registra la acción en logs para auditoría
+        - Rate limited para prevenir abuse
+      operationId: delete_account_auth_delete_delete
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Delete Account
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+  /auth/logout:
+    post:
+      description: |-
+        Logout idempotente:
+        - Si el access token es válido, lo añade a la blacklist.
+        - Si el access token está expirado, responde 200 indicando que ya estaba expirado.
+        - Solo devuelve 401 si el token es completamente inválido (firma/claims corruptos).
+        - Intenta revocar el refresh token si se proporciona.
+      operationId: logout_auth_logout_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Logout
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+  /auth/rotate-key:
+    post:
+      description: Rotación de API keys con período de gracia; acceso restringido
+        a admin.
+      operationId: rotate_api_key_auth_rotate_key_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KeyRotationRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Rotate Api Key Auth Rotate Key Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Rotate Api Key
+      tags:
+      - Authentication
+      - Authentication
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /auth/health/auth:
+    get:
+      description: "Health check para autenticación: Redis, JWT y hashing."
+      operationId: auth_health_check_auth_health_auth_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Auth Health Check
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+    head:
+      description: "Health check para autenticación: Redis, JWT y hashing."
+      operationId: auth_health_check_auth_health_auth_head
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Auth Health Check
+      tags:
+      - Authentication
+      - Authentication
+      x-accepts:
+      - application/json
+  /validate/email:
+    post:
+      description: |-
+        ✅ Endpoint de validación de email con timeout y fallback robusto.
+
+        Cambios principales:
+        - Timeout explícito por plan (FREE: 15s, PREMIUM: 45s, ENTERPRISE: 60s)
+        - Fallback BASIC seguro si se vence
+        - SIEMPRE retorna JSONResponse válida
+        - client_plan en TODAS las respuestas
+        - spam_trap_check ejecutado ANTES del timeout para estar disponible en fallback
+        - Manejo de errores con ResponseBuilder
+        - ✅ NUEVO: Soporte para TLD .test en testing_mode
+      operationId: validate_email_endpoint_validate_email_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailValidationRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Validate Email Endpoint
+      tags:
+      - Validation
+      - Email Validation
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /validate/batch:
+    post:
+      description: Valida múltiples direcciones de email en una sola solicitud.
+      operationId: batch_validate_emails_validate_batch_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchValidationRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchEmailResponse"
+          description: Batch validation completed
+        "400":
+          description: Invalid batch request
+        "413":
+          description: Batch too large
+        "429":
+          description: Rate limit exceeded
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Batch Email Validation
+      tags:
+      - Validation
+      - Email Validation
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /validate/batch/upload:
+    post:
+      operationId: batch_validate_upload_validate_batch_upload_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/Body_batch_validate_upload_validate_batch_upload_post"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Validation completed
+        "400":
+          description: Invalid file or parameters
+        "413":
+          description: File too large
+        "415":
+          description: Unsupported file type
+        "429":
+          description: Rate limit exceeded
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Batch Email Validation via File Upload
+      tags:
+      - Validation
+      - Email Validation
+      x-content-type: multipart/form-data
+      x-accepts:
+      - application/json
+  /validate/stats/cache:
+    get:
+      description: Obtiene estadísticas de cache del sistema.
+      operationId: get_cache_stats_validate_stats_cache_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Get Cache Stats Validate Stats Cache Get
+                type: object
+          description: Successful Response
+      summary: Get Cache Stats
+      tags:
+      - Validation
+      - Email Validation
+      x-accepts:
+      - application/json
+  /validate/stats/usage:
+    get:
+      description: Obtiene estadísticas de uso del cliente actual.
+      operationId: get_usage_stats_validate_stats_usage_get
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Get Usage Stats Validate Stats Usage Get
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Get Usage Stats
+      tags:
+      - Validation
+      - Email Validation
+      x-accepts:
+      - application/json
+  /validate/health:
+    get:
+      description: Health check completo del servicio de validación.
+      operationId: health_check_validate_health_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Health Check Validate Health Get
+                type: object
+          description: Successful Response
+      summary: Health Check
+      tags:
+      - Validation
+      - Email Validation
+      x-accepts:
+      - application/json
+    head:
+      description: Health check completo del servicio de validación.
+      operationId: health_check_validate_health_head
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Health Check Validate Health Head
+                type: object
+          description: Successful Response
+      summary: Health Check
+      tags:
+      - Validation
+      - Email Validation
+      x-accepts:
+      - application/json
+  /billing/billing/webhook:
+    post:
+      description: Webhook de Stripe.
+      operationId: stripe_webhook_billing_billing_webhook_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookResponse"
+          description: Successful Response
+      summary: Stripe Webhook
+      tags:
+      - Billing
+      - Billing
+      x-accepts:
+      - application/json
+  /billing/billing/subscription:
+    get:
+      description: Devuelve información de suscripción (plan y próxima fecha de cobro).
+      operationId: get_subscription_billing_billing_subscription_get
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Get Subscription
+      tags:
+      - Billing
+      - Billing
+      x-accepts:
+      - application/json
+  /billing/billing/create-checkout-session:
+    post:
+      description: Crea una checkout session de Stripe para suscripción.
+      operationId: create_checkout_session_billing_billing_create_checkout_session_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckoutRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckoutSessionResponse"
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Create Checkout Session
+      tags:
+      - Billing
+      - Billing
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /billing/billing/test-notification:
+    post:
+      description: Envía un email de prueba de cambio de plan.
+      operationId: test_notification_billing_billing_test_notification_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              additionalProperties:
+                nullable: true
+                type: string
+              title: Data
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  $ref: "#/components/schemas/Response_Test_Notification_Billing_Billing_Test_Notification_Post_value"
+                title: Response Test Notification Billing Billing Test Notification
+                  Post
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Test Notification
+      tags:
+      - Billing
+      - Billing
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /billing/billing/change-plan:
+    post:
+      description: Cambiar el plan del usuario.
+      operationId: change_plan_billing_billing_change_plan_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Body_change_plan_billing_billing_change_plan_post"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Change Plan Billing Billing Change Plan Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Change Plan
+      tags:
+      - Billing
+      - Billing
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /api-keys/repair-data:
+    post:
+      description: |-
+        Emergency data repair endpoint - ADMINISTRATORS ONLY
+        WARNING: Critical operation; relies on admin scope verification at runtime.
+      operationId: repair_user_data_endpoint_api_keys_repair_data_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  nullable: true
+                  type: string
+                title: Response Repair User Data Endpoint Api Keys Repair Data Post
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Repair User Data Endpoint
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys/force-sync:
+    post:
+      description: |-
+        Force synchronization of user data with rate limiting.
+        Synchronizes API keys with current plan and clears relevant caches.
+        Limited to one sync per 5 minutes per user.
+      operationId: force_sync_api_keys_force_sync_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Force Sync Api Keys Force Sync Post
+                type: object
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Force Sync
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys:
+    get:
+      description: |-
+        List all API keys for current user with consistent IDs.
+        Returns comprehensive key metadata including status, scopes, and usage information.
+        Handles corrupted key data gracefully.
+      operationId: list_api_keys_api_keys_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyListResponse"
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: List Api Keys
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+    post:
+      description: |-
+        Create a new API key with atomic transaction.
+        Generates cryptographically secure API keys with proper scoping
+        based on user's current plan. Enforces maximum key limits.
+      operationId: create_api_key_api_keys_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/APIKeyCreateRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Create Api Key Api Keys Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Create Api Key
+      tags:
+      - API Keys
+      - API Keys
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /api-keys/{key_hash}/revoke:
+    delete:
+      description: |-
+        Revoke an API key with atomic transaction.
+        Immediately invalidates the key and removes it from active sets.
+        Provides audit trail for security compliance.
+      operationId: revoke_api_key_api_keys__key_hash__revoke_delete
+      parameters:
+      - explode: false
+        in: path
+        name: key_hash
+        required: true
+        schema:
+          pattern: "^[a-f0-9]{64}$"
+          title: Key Hash
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Revoke Api Key
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys/sync-plan-keys:
+    post:
+      description: |-
+        Synchronize current plan with all user API keys.
+        Ensures all existing keys have the correct scopes and permissions
+        based on the user's current subscription plan.
+      operationId: sync_plan_keys_api_keys_sync_plan_keys_post
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Sync Plan Keys Api Keys Sync Plan Keys Post
+                type: object
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Sync Plan Keys
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys/{key_hash}/value:
+    get:
+      description: |-
+        Retrieve API key metadata (security-safe).
+        Returns key information without exposing the actual key value.
+        Used for key management and verification purposes.
+      operationId: get_api_key_value_api_keys__key_hash__value_get
+      parameters:
+      - explode: false
+        in: path
+        name: key_hash
+        required: true
+        schema:
+          pattern: "^[a-f0-9]{64}$"
+          title: Key Hash
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Get Api Key Value Api Keys  Key Hash  Value Get
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Get Api Key Value
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys/{key_hash}/rotate:
+    post:
+      description: |-
+        Rotate API key with grace period.
+        Generates a new key while keeping the old one active for 7 days
+        to allow for smooth transition in client applications.
+      operationId: rotate_api_key_api_keys__key_hash__rotate_post
+      parameters:
+      - explode: false
+        in: path
+        name: key_hash
+        required: true
+        schema:
+          pattern: "^[a-f0-9]{64}$"
+          title: Key Hash
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Rotate Api Key Api Keys  Key Hash  Rotate Post
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Rotate Api Key
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /api-keys/usage:
+    get:
+      description: |-
+        Get current API usage statistics.
+        Returns usage count, limits, and remaining requests for today.
+        Works with both API keys and JWT tokens.
+      operationId: get_usage_api_keys_usage_get
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                title: Response Get Usage Api Keys Usage Get
+                type: object
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Get Usage
+      tags:
+      - API Keys
+      - API Keys
+      x-accepts:
+      - application/json
+  /jobs/v1/jobs:
+    post:
+      operationId: create_job_jobs_v1_jobs_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-Idempotency-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobCreateRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCreateResponse"
+          description: Successful Response
+        "201":
+          description: Job queued
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+        "409":
+          description: Idempotent replay
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Create validation job
+      tags:
+      - Jobs
+      - Jobs
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /jobs/v1/jobs/{job_id}:
+    get:
+      operationId: get_job_status_jobs_v1_jobs__job_id__get
+      parameters:
+      - explode: false
+        in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Get job status
+      tags:
+      - Jobs
+      - Jobs
+      x-accepts:
+      - application/json
+  /jobs/v1/jobs/{job_id}/results:
+    get:
+      operationId: get_job_results_jobs_v1_jobs__job_id__results_get
+      parameters:
+      - explode: false
+        in: path
+        name: job_id
+        required: true
+        schema:
+          title: Job Id
+          type: string
+        style: simple
+      - explode: true
+        in: query
+        name: page
+        required: false
+        schema:
+          default: 1
+          title: Page
+          type: integer
+        style: form
+      - explode: true
+        in: query
+        name: size
+        required: false
+        schema:
+          default: 500
+          title: Size
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResultsPage"
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Get job results (paged)
+      tags:
+      - Jobs
+      - Jobs
+      x-accepts:
+      - application/json
+  /webhooks/v1/webhooks/endpoints/register:
+    post:
+      operationId: register_endpoint_webhooks_v1_webhooks_endpoints_register_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterEndpoint"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Register Endpoint
+      tags:
+      - Webhooks
+      - Webhooks
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /webhooks/v1/webhooks/endpoints/rotate:
+    post:
+      operationId: rotate_secret_webhooks_v1_webhooks_endpoints_rotate_post
+      parameters:
+      - explode: false
+        in: header
+        name: X-API-Key
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateSecret"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Rotate Secret
+      tags:
+      - Webhooks
+      - Webhooks
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /logs/logs/requests:
+    delete:
+      description: Clear all request logs for current user.
+      operationId: clear_request_logs_logs_logs_requests_delete
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: Clear Request Logs
+      tags:
+      - Logs
+      - Developer Tools
+      x-accepts:
+      - application/json
+    get:
+      description: Get request logs for authenticated user.
+      operationId: get_request_logs_logs_logs_requests_get
+      parameters:
+      - description: Max results to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Max results to return
+          maximum: 500
+          title: Limit
+          type: integer
+        style: form
+      - description: Filter by HTTP status code
+        explode: true
+        in: query
+        name: status_code
+        required: false
+        schema:
+          nullable: true
+          type: integer
+        style: form
+      - description: Filter by endpoint path
+        explode: true
+        in: query
+        name: endpoint
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "Filter by HTTP method (GET, POST, etc)"
+        explode: true
+        in: query
+        name: method
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Filter by timestamp (ISO 8601)
+        explode: true
+        in: query
+        name: since
+        required: false
+        schema:
+          format: date-time
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Get Request Logs
+      tags:
+      - Logs
+      - Developer Tools
+      x-accepts:
+      - application/json
+  /webhooks-management/webhooks/:
+    get:
+      description: List all webhooks for authenticated user.
+      operationId: list_webhooks_webhooks_management_webhooks__get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      security:
+      - Bearer: []
+      summary: List Webhooks
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-accepts:
+      - application/json
+    post:
+      description: |-
+        Create a new webhook endpoint.
+
+        Events available:
+        - validation.completed: Single email validation finished
+        - batch.completed: Batch validation finished
+        - usage.limit_reached: API usage limit reached (80%)
+      operationId: create_webhook_webhooks_management_webhooks__post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookCreate"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Create Webhook
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /webhooks-management/webhooks/{webhook_id}:
+    delete:
+      description: Delete webhook.
+      operationId: delete_webhook_webhooks_management_webhooks__webhook_id__delete
+      parameters:
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Delete Webhook
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-accepts:
+      - application/json
+    get:
+      description: Get webhook details.
+      operationId: get_webhook_webhooks_management_webhooks__webhook_id__get
+      parameters:
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Get Webhook
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-accepts:
+      - application/json
+    patch:
+      description: Update webhook configuration.
+      operationId: update_webhook_webhooks_management_webhooks__webhook_id__patch
+      parameters:
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookUpdate"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Update Webhook
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-content-type: application/json
+      x-accepts:
+      - application/json
+  /webhooks-management/webhooks/{webhook_id}/test:
+    post:
+      description: Send test event to webhook.
+      operationId: test_webhook_webhooks_management_webhooks__webhook_id__test_post
+      parameters:
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Test Webhook
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-accepts:
+      - application/json
+  /webhooks-management/webhooks/{webhook_id}/deliveries:
+    get:
+      description: Get delivery history for webhook.
+      operationId: get_deliveries_webhooks_management_webhooks__webhook_id__deliveries_get
+      parameters:
+      - explode: false
+        in: path
+        name: webhook_id
+        required: true
+        schema:
+          title: Webhook Id
+          type: string
+        style: simple
+      - explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          maximum: 500
+          title: Limit
+          type: integer
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      security:
+      - Bearer: []
+      summary: Get Deliveries
+      tags:
+      - Webhooks Management
+      - Webhooks
+      x-accepts:
+      - application/json
+  /health:
+    get:
+      description: |-
+        Basic health check for load balancers.
+
+        Returns 200 if service is running.
+        Fast response, no dependency checks.
+      operationId: basic_health_health_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Basic health check
+      tags:
+      - Health
+      - Health
+      x-accepts:
+      - application/json
+  /health/live:
+    get:
+      description: |-
+        Kubernetes liveness probe.
+
+        Returns 200 if the application is running.
+        Should restart pod if this fails.
+      operationId: liveness_health_live_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Liveness probe (Kubernetes)
+      tags:
+      - Health
+      - Health
+      x-accepts:
+      - application/json
+  /health/ready:
+    get:
+      description: |-
+        Kubernetes readiness probe.
+
+        Returns 200 if service is ready to accept traffic.
+        Checks critical dependencies (Redis).
+      operationId: readiness_health_ready_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Readiness probe (Kubernetes)
+      tags:
+      - Health
+      - Health
+      x-accepts:
+      - application/json
+  /health/detailed:
+    get:
+      description: |-
+        Detailed health check with all component statuses.
+
+        Returns comprehensive health information for monitoring.
+      operationId: detailed_health_health_detailed_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Detailed health check
+      tags:
+      - Health
+      - Health
+      x-accepts:
+      - application/json
+  /admin/audit_project:
+    post:
+      description: |-
+        Lanza auditoría en path (ruta absoluta o relativa a la raíz del proyecto).
+        Header obligatorio: X-Audit-Token: <AUDIT_SECRET>
+      operationId: run_audit_admin_audit_project_post
+      parameters:
+      - explode: true
+        in: query
+        name: path
+        required: false
+        schema:
+          default: "."
+          title: Path
+          type: string
+        style: form
+      - explode: false
+        in: header
+        name: x-audit-token
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+          description: Validation Error
+      summary: Run Audit
+      x-accepts:
+      - application/json
+  /status:
+    get:
+      description: |-
+        ✅ MEJORA: Detailed service status with feature flags
+
+        Shows which features are available and which are running in degraded mode
+      operationId: service_status_status_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Service Status
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+  /admin/circuit-breaker-status:
+    get:
+      description: |-
+        ✅ Circuit breaker status for all services.
+        Shows state of Redis, SMTP, DNS, and other circuit breakers.
+      operationId: circuit_breaker_status_admin_circuit_breaker_status_get
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: {}
+          description: Successful Response
+      summary: Circuit Breaker Status
+      tags:
+      - Health
+      x-accepts:
+      - application/json
+components:
+  schemas:
+    APIKeyCreateRequest:
+      additionalProperties: false
+      description: API Key creation request
+      example:
+        name: name
+        scopes:
+        - scopes
+        - scopes
+      properties:
+        name:
+          maxLength: 100
+          minLength: 1
+          nullable: true
+          type: string
+        scopes:
+          description: Access scopes for the API Key
+          items:
+            type: string
+          type: array
+      title: APIKeyCreateRequest
+    APIKeyListResponse:
+      additionalProperties: false
+      description: API Key list response
+      example:
+        keys:
+        - revoked_at: 2000-01-23T04:56:07.000+00:00
+          key_hash: key_hash
+          last_used: 2000-01-23T04:56:07.000+00:00
+          name: name
+          created_at: 2000-01-23T04:56:07.000+00:00
+          id: id
+          scopes:
+          - scopes
+          - scopes
+          revoked: true
+          plan: ""
+        - revoked_at: 2000-01-23T04:56:07.000+00:00
+          key_hash: key_hash
+          last_used: 2000-01-23T04:56:07.000+00:00
+          name: name
+          created_at: 2000-01-23T04:56:07.000+00:00
+          id: id
+          scopes:
+          - scopes
+          - scopes
+          revoked: true
+          plan: ""
+        total_count: 0
+        active_count: 0
+      properties:
+        keys:
+          description: List of API keys
+          items:
+            $ref: "#/components/schemas/APIKeyMeta"
+          type: array
+        total_count:
+          description: Total number of keys
+          minimum: 0.0
+          title: Total Count
+          type: integer
+        active_count:
+          description: Number of active keys
+          minimum: 0.0
+          title: Active Count
+          type: integer
+      required:
+      - active_count
+      - keys
+      - total_count
+      title: APIKeyListResponse
+    APIKeyMeta:
+      additionalProperties: false
+      description: API Key metadata
+      example:
+        revoked_at: 2000-01-23T04:56:07.000+00:00
+        key_hash: key_hash
+        last_used: 2000-01-23T04:56:07.000+00:00
+        name: name
+        created_at: 2000-01-23T04:56:07.000+00:00
+        id: id
+        scopes:
+        - scopes
+        - scopes
+        revoked: true
+        plan: ""
+      properties:
+        id:
+          description: Unique key identifier
+          title: Id
+          type: string
+        key_hash:
+          description: Hashed key value
+          title: Key Hash
+          type: string
+        plan:
+          allOf:
+          - $ref: "#/components/schemas/PlanEnum"
+          description: Associated plan
+        created_at:
+          description: Creation timestamp
+          format: date-time
+          title: Created At
+          type: string
+        revoked:
+          description: Revocation status
+          title: Revoked
+          type: boolean
+        revoked_at:
+          format: date-time
+          nullable: true
+          type: string
+        scopes:
+          description: Access scopes
+          items:
+            type: string
+          type: array
+        name:
+          nullable: true
+          type: string
+        last_used:
+          format: date-time
+          nullable: true
+          type: string
+      required:
+      - created_at
+      - id
+      - key_hash
+      - plan
+      - revoked
+      title: APIKeyMeta
+    BatchEmailResponse:
+      additionalProperties: false
+      description: Batch validation response
+      example:
+        processing_time: 0.5962133916683182
+        average_time: 0.5637376656633328
+        valid_count: 0
+        count: 0
+        invalid_count: 0
+        results:
+        - processing_time: 0.23021358869347652
+          suggested_action: suggested_action
+          smtp: ""
+          risk_score: 0.3616076749251911
+          quality_score: 0.9301444243932576
+          dns: ""
+          reputation: 0.7061401241503109
+          valid: true
+          risk_level: ""
+          provider: provider
+          fingerprint: fingerprint
+          validation_tier: validation_tier
+          suggestions:
+          - suggestions
+          - suggestions
+          detail: ""
+          email: email
+        - processing_time: 0.23021358869347652
+          suggested_action: suggested_action
+          smtp: ""
+          risk_score: 0.3616076749251911
+          quality_score: 0.9301444243932576
+          dns: ""
+          reputation: 0.7061401241503109
+          valid: true
+          risk_level: ""
+          provider: provider
+          fingerprint: fingerprint
+          validation_tier: validation_tier
+          suggestions:
+          - suggestions
+          - suggestions
+          detail: ""
+          email: email
+      properties:
+        count:
+          description: Total emails processed
+          minimum: 0.0
+          title: Count
+          type: integer
+        valid_count:
+          description: Number of valid emails
+          minimum: 0.0
+          title: Valid Count
+          type: integer
+        invalid_count:
+          description: Number of invalid emails
+          minimum: 0.0
+          title: Invalid Count
+          type: integer
+        processing_time:
+          description: Total processing time in seconds
+          minimum: 0.0
+          title: Processing Time
+          type: number
+        average_time:
+          description: Average processing time per email
+          minimum: 0.0
+          title: Average Time
+          type: number
+        results:
+          description: Individual validation results
+          items:
+            $ref: "#/components/schemas/EmailResponse"
+          type: array
+      required:
+      - average_time
+      - count
+      - invalid_count
+      - processing_time
+      - results
+      - valid_count
+      title: BatchEmailResponse
+    BatchValidationRequest:
+      additionalProperties: false
+      description: Request model for batch email validation
+      example:
+        emails:
+        - emails
+        - emails
+        - emails
+        - emails
+        - emails
+        batch_size: 81
+        check_smtp: false
+        include_raw_dns: false
+        concurrent_requests: 30
+      properties:
+        emails:
+          description: List of email addresses to validate (can include invalid formats)
+          items:
+            type: string
+          maxItems: 1000
+          minItems: 1
+          type: array
+        check_smtp:
+          default: false
+          description: Perform SMTP verification for all emails
+          title: Check Smtp
+          type: boolean
+        include_raw_dns:
+          default: false
+          description: Include raw DNS records in responses
+          title: Include Raw Dns
+          type: boolean
+        batch_size:
+          default: 100
+          description: Number of emails to process in each batch
+          maximum: 1000.0
+          minimum: 1.0
+          title: Batch Size
+          type: integer
+        concurrent_requests:
+          default: 5
+          description: Maximum concurrent validation requests
+          maximum: 50.0
+          minimum: 1.0
+          title: Concurrent Requests
+          type: integer
+      required:
+      - emails
+      title: BatchValidationRequest
+    Body_batch_validate_upload_validate_batch_upload_post:
+      properties:
+        file:
+          format: binary
+          title: File
+          type: string
+        column:
+          nullable: true
+          type: string
+        include_raw_dns:
+          default: false
+          title: Include Raw Dns
+          type: boolean
+        check_smtp:
+          default: false
+          title: Check Smtp
+          type: boolean
+      required:
+      - file
+      title: Body_batch_validate_upload_validate_batch_upload_post
+    Body_change_plan_billing_billing_change_plan_post:
+      properties:
+        plan:
+          title: Plan
+          type: string
+      required:
+      - plan
+      title: Body_change_plan_billing_billing_change_plan_post
+    CheckoutRequest:
+      description: Request para crear checkout sessions.
+      example:
+        plan: plan
+      properties:
+        plan:
+          description: "Plan: PREMIUM o ENTERPRISE"
+          title: Plan
+          type: string
+      required:
+      - plan
+      title: CheckoutRequest
+    CheckoutSessionResponse:
+      description: Respuesta al crear checkout session.
+      example:
+        session_id: session_id
+      properties:
+        session_id:
+          title: Session Id
+          type: string
+      required:
+      - session_id
+      title: CheckoutSessionResponse
+    DNSInfo:
+      additionalProperties: false
+      description: Comprehensive DNS information for email validation
+      properties:
+        spf:
+          allOf:
+          - $ref: "#/components/schemas/DNSRecordSPF"
+          nullable: true
+        dkim:
+          allOf:
+          - $ref: "#/components/schemas/DNSRecordDKIM"
+          nullable: true
+        dmarc:
+          allOf:
+          - $ref: "#/components/schemas/DNSRecordDMARC"
+          nullable: true
+        mx_records:
+          description: MX records
+          items:
+            type: string
+          type: array
+        ns_records:
+          description: Name servers
+          items:
+            type: string
+          type: array
+      title: DNSInfo
+    DNSRecordDKIM:
+      additionalProperties: false
+      description: DKIM DNS record information
+      properties:
+        status:
+          nullable: true
+          type: string
+        selector:
+          nullable: true
+          type: string
+        key_type:
+          nullable: true
+          type: string
+        key_length:
+          nullable: true
+          type: integer
+        record:
+          nullable: true
+          type: string
+      title: DNSRecordDKIM
+    DNSRecordDMARC:
+      additionalProperties: false
+      description: DMARC DNS record information
+      properties:
+        status:
+          nullable: true
+          type: string
+        policy:
+          nullable: true
+          type: string
+        record:
+          nullable: true
+          type: string
+        pct:
+          nullable: true
+          type: integer
+      title: DNSRecordDMARC
+    DNSRecordSPF:
+      additionalProperties: false
+      description: SPF DNS record information
+      properties:
+        status:
+          nullable: true
+          type: string
+        record:
+          nullable: true
+          type: string
+        mechanism:
+          nullable: true
+          type: string
+        domain:
+          nullable: true
+          type: string
+      title: DNSRecordSPF
+    EmailResponse:
+      additionalProperties: false
+      description: Comprehensive email validation response
+      example:
+        processing_time: 0.23021358869347652
+        suggested_action: suggested_action
+        smtp: ""
+        risk_score: 0.3616076749251911
+        quality_score: 0.9301444243932576
+        dns: ""
+        reputation: 0.7061401241503109
+        valid: true
+        risk_level: ""
+        provider: provider
+        fingerprint: fingerprint
+        validation_tier: validation_tier
+        suggestions:
+        - suggestions
+        - suggestions
+        detail: ""
+        email: email
+      properties:
+        email:
+          description: Validated email address
+          maxLength: 254
+          minLength: 5
+          title: Email
+          type: string
+        valid:
+          description: Overall validation result
+          title: Valid
+          type: boolean
+        detail:
+          default: ""
+          description: Validation details summary
+          title: Detail
+          type: string
+        processing_time:
+          minimum: 0.0
+          nullable: true
+          type: number
+        provider:
+          nullable: true
+          type: string
+        reputation:
+          maximum: 1.0
+          minimum: 0.0
+          nullable: true
+          type: number
+        fingerprint:
+          nullable: true
+          type: string
+        quality_score:
+          maximum: 1.0
+          minimum: 0.0
+          nullable: true
+          type: number
+        risk_level:
+          allOf:
+          - $ref: "#/components/schemas/RiskLevelEnum"
+          nullable: true
+        suggestions:
+          description: Improvement suggestions
+          items:
+            type: string
+          type: array
+        smtp:
+          allOf:
+          - $ref: "#/components/schemas/SMTPInfo"
+          nullable: true
+        dns:
+          allOf:
+          - $ref: "#/components/schemas/DNSInfo"
+          nullable: true
+        risk_score:
+          maximum: 1.0
+          minimum: 0.0
+          nullable: true
+          type: number
+        validation_tier:
+          nullable: true
+          type: string
+        suggested_action:
+          nullable: true
+          type: string
+      required:
+      - email
+      - valid
+      title: EmailResponse
+    EmailValidationRequest:
+      additionalProperties: false
+      description: Request model for single email validation
+      example:
+        testing_mode: false
+        check_smtp: false
+        include_raw_dns: false
+        priority: ""
+        email: email
+      properties:
+        email:
+          description: Email address to validate (RFC 5321 compliant)
+          maxLength: 320
+          minLength: 3
+          title: Email
+          type: string
+        check_smtp:
+          default: false
+          description: Enable SMTP mailbox verification
+          title: Check Smtp
+          type: boolean
+        include_raw_dns:
+          default: false
+          description: Include raw DNS records
+          title: Include Raw Dns
+          type: boolean
+        testing_mode:
+          default: false
+          description: "Enable testing mode (allows special TLDs like .test, .example,\
+            \ etc.)"
+          title: Testing Mode
+          type: boolean
+        priority:
+          allOf:
+          - $ref: "#/components/schemas/PriorityEnum"
+          default: standard
+          description: Validation priority level
+      required:
+      - email
+      title: EmailValidationRequest
+    HTTPValidationError:
+      example:
+        detail:
+        - msg: msg
+          loc:
+          - ValidationError_loc_inner
+          - ValidationError_loc_inner
+          type: type
+        - msg: msg
+          loc:
+          - ValidationError_loc_inner
+          - ValidationError_loc_inner
+          type: type
+      properties:
+        detail:
+          items:
+            $ref: "#/components/schemas/ValidationError"
+          type: array
+      title: HTTPValidationError
+    JobCreateRequest:
+      example:
+        emails:
+        - emails
+        - emails
+        callback_url: callback_url
+        includerawdns: false
+        metadata: "{}"
+        sandbox: false
+        file_token: file_token
+        source: source
+        checksmtp: false
+      properties:
+        source:
+          description: Origen de los datos
+          pattern: ^(list|upload)$
+          title: Source
+          type: string
+        emails:
+          items:
+            type: string
+          nullable: true
+          type: array
+        file_token:
+          nullable: true
+          type: string
+        checksmtp:
+          default: false
+          title: Checksmtp
+          type: boolean
+        includerawdns:
+          default: false
+          title: Includerawdns
+          type: boolean
+        callback_url:
+          nullable: true
+          type: string
+        sandbox:
+          default: false
+          title: Sandbox
+          type: boolean
+        metadata:
+          nullable: true
+          type: object
+      required:
+      - source
+      title: JobCreateRequest
+    JobCreateResponse:
+      example:
+        job_id: job_id
+        created_at: created_at
+        status: status
+      properties:
+        job_id:
+          title: Job Id
+          type: string
+        status:
+          title: Status
+          type: string
+        created_at:
+          title: Created At
+          type: string
+      required:
+      - created_at
+      - job_id
+      - status
+      title: JobCreateResponse
+    JobResultEntry:
+      example:
+        valid: true
+        metadata: "{}"
+        smtp: "{}"
+        provider: provider
+        riskscore: 5.962133916683182
+        dns: "{}"
+        reputation: 2.3021358869347655
+        qualityscore: 5.637376656633329
+        email: email
+      properties:
+        email:
+          title: Email
+          type: string
+        valid:
+          title: Valid
+          type: boolean
+        riskscore:
+          nullable: true
+          type: number
+        qualityscore:
+          nullable: true
+          type: number
+        provider:
+          nullable: true
+          type: string
+        reputation:
+          nullable: true
+          type: number
+        smtp:
+          title: Smtp
+          type: object
+        dns:
+          title: Dns
+          type: object
+        metadata:
+          title: Metadata
+          type: object
+      required:
+      - email
+      - valid
+      title: JobResultEntry
+    JobResultsPage:
+      example:
+        size: 6
+        job_id: job_id
+        page: 0
+        total_pages: 1
+        results:
+        - valid: true
+          metadata: "{}"
+          smtp: "{}"
+          provider: provider
+          riskscore: 5.962133916683182
+          dns: "{}"
+          reputation: 2.3021358869347655
+          qualityscore: 5.637376656633329
+          email: email
+        - valid: true
+          metadata: "{}"
+          smtp: "{}"
+          provider: provider
+          riskscore: 5.962133916683182
+          dns: "{}"
+          reputation: 2.3021358869347655
+          qualityscore: 5.637376656633329
+          email: email
+      properties:
+        job_id:
+          title: Job Id
+          type: string
+        page:
+          title: Page
+          type: integer
+        size:
+          title: Size
+          type: integer
+        total_pages:
+          title: Total Pages
+          type: integer
+        results:
+          items:
+            $ref: "#/components/schemas/JobResultEntry"
+          type: array
+      required:
+      - job_id
+      - page
+      - results
+      - size
+      - total_pages
+      title: JobResultsPage
+    JobStatusResponse:
+      example:
+        finished_at: finished_at
+        job_id: job_id
+        counts:
+          key: 0
+        started_at: started_at
+        error: error
+        status: status
+      properties:
+        job_id:
+          title: Job Id
+          type: string
+        status:
+          title: Status
+          type: string
+        counts:
+          additionalProperties:
+            type: integer
+          title: Counts
+        started_at:
+          nullable: true
+          type: string
+        finished_at:
+          nullable: true
+          type: string
+        error:
+          nullable: true
+          type: string
+      required:
+      - job_id
+      - status
+      title: JobStatusResponse
+    KeyRotationRequest:
+      additionalProperties: false
+      description: API Key rotation request
+      example:
+        new_key: new_key
+        old_key: old_key
+        grace_period: 207574
+      properties:
+        old_key:
+          description: Current API key to rotate from
+          maxLength: 128
+          minLength: 32
+          title: Old Key
+          type: string
+        new_key:
+          description: New API key to rotate to
+          maxLength: 128
+          minLength: 32
+          title: New Key
+          type: string
+        grace_period:
+          default: 86400
+          description: Grace period in seconds (max 30 days)
+          maximum: 2592000.0
+          minimum: 0.0
+          title: Grace Period
+          type: integer
+      required:
+      - new_key
+      - old_key
+      title: KeyRotationRequest
+    PlanEnum:
+      enum:
+      - FREE
+      - PREMIUM
+      - ENTERPRISE
+      title: PlanEnum
+      type: string
+    PriorityEnum:
+      enum:
+      - low
+      - standard
+      - high
+      title: PriorityEnum
+      type: string
+    RegisterEndpoint:
+      example:
+        callback_url: https://openapi-generator.tech
+      properties:
+        callback_url:
+          format: uri
+          minLength: 1
+          title: Callback Url
+          type: string
+      required:
+      - callback_url
+      title: RegisterEndpoint
+    RiskLevelEnum:
+      enum:
+      - low
+      - medium
+      - high
+      - unknown
+      title: RiskLevelEnum
+      type: string
+    RotateSecret:
+      example:
+        endpoint_id: endpoint_id
+      properties:
+        endpoint_id:
+          title: Endpoint Id
+          type: string
+      required:
+      - endpoint_id
+      title: RotateSecret
+    SMTPInfo:
+      additionalProperties: false
+      description: SMTP verification results
+      properties:
+        checked:
+          description: SMTP check was performed
+          title: Checked
+          type: boolean
+        mailbox_exists:
+          nullable: true
+          type: boolean
+        mx_server:
+          nullable: true
+          type: string
+        response_time:
+          nullable: true
+          type: number
+        error_message:
+          nullable: true
+          type: string
+      required:
+      - checked
+      title: SMTPInfo
+    SubscriptionResponse:
+      description: Respuesta con información de suscripción.
+      example:
+        customer_id: customer_id
+        plan: plan
+        next_billing_date: next_billing_date
+        status: active
+      properties:
+        plan:
+          title: Plan
+          type: string
+        next_billing_date:
+          nullable: true
+          type: string
+        status:
+          default: active
+          title: Status
+          type: string
+        customer_id:
+          nullable: true
+          type: string
+      required:
+      - plan
+      title: SubscriptionResponse
+    UserLogin:
+      additionalProperties: false
+      description: User login request
+      example:
+        password: password
+        email: email
+      properties:
+        email:
+          description: User email address
+          format: email
+          title: Email
+          type: string
+        password:
+          description: User password
+          maxLength: 128
+          minLength: 8
+          title: Password
+          type: string
+      required:
+      - email
+      - password
+      title: UserLogin
+    UserRegister:
+      additionalProperties: false
+      description: User registration request
+      example:
+        password: password
+        plan: ""
+        email: email
+      properties:
+        email:
+          description: User email address
+          format: email
+          title: Email
+          type: string
+        password:
+          description: User password
+          maxLength: 128
+          minLength: 8
+          title: Password
+          type: string
+        plan:
+          allOf:
+          - $ref: "#/components/schemas/PlanEnum"
+          default: FREE
+          description: Subscription plan
+      required:
+      - email
+      - password
+      title: UserRegister
+    ValidationError:
+      example:
+        msg: msg
+        loc:
+        - ValidationError_loc_inner
+        - ValidationError_loc_inner
+        type: type
+      properties:
+        loc:
+          items:
+            $ref: "#/components/schemas/ValidationError_loc_inner"
+          type: array
+        msg:
+          title: Message
+          type: string
+        type:
+          title: Error Type
+          type: string
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    WebhookCreate:
+      example:
+        description: description
+        secret: secret
+        url: https://openapi-generator.tech
+        events:
+        - events
+        - events
+      properties:
+        url:
+          format: uri
+          maxLength: 2083
+          minLength: 1
+          title: Url
+          type: string
+        events:
+          default:
+          - validation.completed
+          - batch.completed
+          items:
+            type: string
+          type: array
+        secret:
+          nullable: true
+          type: string
+        description:
+          nullable: true
+          type: string
+      required:
+      - url
+      title: WebhookCreate
+    WebhookResponse:
+      description: Respuesta genérica para el webhook.
+      example:
+        event_id: event_id
+        message: message
+        status: status
+      properties:
+        status:
+          title: Status
+          type: string
+        event_id:
+          nullable: true
+          type: string
+        message:
+          nullable: true
+          type: string
+      required:
+      - status
+      title: WebhookResponse
+    WebhookUpdate:
+      example:
+        description: description
+        url: https://openapi-generator.tech
+        events:
+        - events
+        - events
+        status: status
+      properties:
+        url:
+          format: uri
+          maxLength: 2083
+          minLength: 1
+          nullable: true
+          type: string
+        events:
+          items:
+            type: string
+          nullable: true
+          type: array
+        status:
+          nullable: true
+          type: string
+        description:
+          nullable: true
+          type: string
+      title: WebhookUpdate
+    Response_Test_Notification_Billing_Billing_Test_Notification_Post_value:
+      anyOf:
+      - nullable: true
+        type: string
+      - type: boolean
+    ValidationError_loc_inner:
+      anyOf:
+      - type: string
+      - type: integer
+  securitySchemes:
+    Bearer:
+      bearerFormat: JWT
+      description: JWT token for authentication
+      scheme: bearer
+      type: http
+    ApiKeyAuth:
+      description: API Key for validation endpoints
+      in: header
+      name: X-API-Key
+      type: apiKey
+
